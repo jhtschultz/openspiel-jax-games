@@ -117,11 +117,12 @@ def card_points_fn(card):
 # =============================================================================
 
 # Precompute meld overlap matrix (1 = overlapping, 0 = compatible)
+# Vectorized: two melds overlap if they share any card
+_meld_masks_np = np.array(MELD_MASKS)  # Convert once to numpy
 _meld_overlap = np.zeros((NUM_MELDS, NUM_MELDS), dtype=np.int8)
 for _i in range(NUM_MELDS):
     for _j in range(NUM_MELDS):
-        _overlap = np.any(np.array(MELD_MASKS[_i]) & np.array(MELD_MASKS[_j]))
-        _meld_overlap[_i, _j] = 1 if _overlap else 0
+        _meld_overlap[_i, _j] = 1 if np.any(_meld_masks_np[_i] & _meld_masks_np[_j]) else 0
 MELD_OVERLAP = jnp.array(_meld_overlap)
 MELD_COMPAT = 1 - MELD_OVERLAP
 
@@ -257,7 +258,8 @@ def init_state(rng_key):
         'winner': jnp.int8(-1),  # -1=ongoing, 0=p0, 1=p1, 2=draw
         'p0_score': jnp.int32(0),
         'p1_score': jnp.int32(0),
-        'last_draw_from_discard': jnp.bool_(False),
+        'drawn_from_discard': jnp.int8(-1),  # Card drawn from discard (-1 if none/stock)
+        'repeated_move': jnp.bool_(False),  # True if prev player drew upcard and discarded it back
         'pass_count': jnp.int8(0),  # For first upcard phase
     }
 
@@ -294,15 +296,22 @@ def legal_actions_mask(state):
     mask = jnp.where(first_upcard, mask.at[ACTION_PASS].set(True), mask)
 
     # Phase: Draw - can draw from stock or upcard
+    # Wall condition: when stock has <= 2 cards, only pass is allowed
     draw_phase = (phase == PHASE_DRAW)
-    has_stock = jnp.any(state['stock_mask'] > 0)
+    stock_count = jnp.sum(state['stock_mask'])
+    is_wall = stock_count <= 2
+    has_stock = stock_count > 0
     has_upcard = (state['upcard'] >= 0)
-    mask = jnp.where(draw_phase & has_stock, mask.at[ACTION_DRAW_STOCK].set(True), mask)
-    mask = jnp.where(draw_phase & has_upcard, mask.at[ACTION_DRAW_UPCARD].set(True), mask)
 
-    # Phase: Discard - can discard any card in hand, maybe knock
+    # In wall phase, only pass is allowed
+    mask = jnp.where(draw_phase & is_wall, mask.at[ACTION_PASS].set(True), mask)
+    # Normal draw phase - can draw from stock or upcard
+    mask = jnp.where(draw_phase & ~is_wall & has_stock, mask.at[ACTION_DRAW_STOCK].set(True), mask)
+    mask = jnp.where(draw_phase & ~is_wall & has_upcard, mask.at[ACTION_DRAW_UPCARD].set(True), mask)
+
+    # Phase: Discard - can discard any card in hand
     discard_phase = (phase == PHASE_DISCARD)
-    # Can discard any card in hand
+    # Can discard any card in hand (discarding same card drawn from discard ends game)
     for c in range(NUM_CARDS):
         mask = jnp.where(discard_phase & (hand[c] > 0), mask.at[c].set(True), mask)
 
@@ -341,7 +350,8 @@ def step(state, action):
     new_done = state['done']
     new_winner = state['winner']
     new_pass_count = state['pass_count']
-    new_last_draw_from_discard = state['last_draw_from_discard']
+    new_drawn_from_discard = state['drawn_from_discard']
+    new_repeated_move = state['repeated_move']
 
     # Handle FirstUpcard phase
     is_first_upcard = (phase == PHASE_FIRST_UPCARD)
@@ -353,6 +363,8 @@ def step(state, action):
     new_phase = jnp.where(is_pass_first & both_passed, jnp.int8(PHASE_DRAW), new_phase)
     new_current_player = jnp.where(is_pass_first & both_passed, jnp.int8(0), new_current_player)
     new_current_player = jnp.where(is_pass_first & ~both_passed, jnp.int8(1 - player), new_current_player)
+    # When both pass on first upcard, that upcard can no longer be drawn
+    new_upcard = jnp.where(is_pass_first & both_passed, jnp.int8(-1), new_upcard)
 
     # Action: Draw upcard in first upcard
     is_draw_up_first = is_first_upcard & (action == ACTION_DRAW_UPCARD)
@@ -362,6 +374,8 @@ def step(state, action):
     new_p1_hand = jnp.where(is_draw_up_first & (player == 1), updated_hand, new_p1_hand)
     new_upcard = jnp.where(is_draw_up_first, jnp.int8(-1), new_upcard)
     new_phase = jnp.where(is_draw_up_first, jnp.int8(PHASE_DISCARD), new_phase)
+    # Track that we drew this card from discard (can't discard it back)
+    new_drawn_from_discard = jnp.where(is_draw_up_first, jnp.int8(upcard), new_drawn_from_discard)
 
     # Handle Draw phase
     is_draw_phase = (phase == PHASE_DRAW)
@@ -369,14 +383,15 @@ def step(state, action):
     # Action: Draw from stock
     is_draw_stock = is_draw_phase & (action == ACTION_DRAW_STOCK)
     stock_idx = state['stock_top_idx']
-    drawn_card = state['stock_order'][stock_idx]
-    updated_hand_stock = hand.at[drawn_card].set(1)
+    drawn_card_stock = state['stock_order'][stock_idx]
+    updated_hand_stock = hand.at[drawn_card_stock].set(1)
     new_p0_hand = jnp.where(is_draw_stock & (player == 0), updated_hand_stock, new_p0_hand)
     new_p1_hand = jnp.where(is_draw_stock & (player == 1), updated_hand_stock, new_p1_hand)
-    new_stock_mask = jnp.where(is_draw_stock, new_stock_mask.at[drawn_card].set(0), new_stock_mask)
+    new_stock_mask = jnp.where(is_draw_stock, new_stock_mask.at[drawn_card_stock].set(0), new_stock_mask)
     new_stock_top_idx = jnp.where(is_draw_stock, stock_idx + 1, new_stock_top_idx)
     new_phase = jnp.where(is_draw_stock, jnp.int8(PHASE_DISCARD), new_phase)
-    new_last_draw_from_discard = jnp.where(is_draw_stock, False, new_last_draw_from_discard)
+    # Drawing from stock - can discard any card
+    new_drawn_from_discard = jnp.where(is_draw_stock, jnp.int8(-1), new_drawn_from_discard)
 
     # Action: Draw upcard (in draw phase)
     is_draw_up = is_draw_phase & (action == ACTION_DRAW_UPCARD)
@@ -386,7 +401,14 @@ def step(state, action):
     new_p1_hand = jnp.where(is_draw_up & (player == 1), updated_hand_up, new_p1_hand)
     new_upcard = jnp.where(is_draw_up, jnp.int8(-1), new_upcard)
     new_phase = jnp.where(is_draw_up, jnp.int8(PHASE_DISCARD), new_phase)
-    new_last_draw_from_discard = jnp.where(is_draw_up, True, new_last_draw_from_discard)
+    # Track that we drew this card from discard (can't discard it back)
+    new_drawn_from_discard = jnp.where(is_draw_up, jnp.int8(upcard_draw), new_drawn_from_discard)
+
+    # Action: Pass in draw phase (Wall) - ends game in draw
+    is_pass_wall = is_draw_phase & (action == ACTION_PASS)
+    new_phase = jnp.where(is_pass_wall, jnp.int8(PHASE_GAME_OVER), new_phase)
+    new_done = jnp.where(is_pass_wall, True, new_done)
+    new_winner = jnp.where(is_pass_wall, jnp.int8(2), new_winner)  # 2 = draw
 
     # Handle Discard phase - need to use updated hands
     current_p0 = jnp.where(is_draw_up_first & (player == 0), updated_hand,
@@ -405,13 +427,31 @@ def step(state, action):
     new_discard_mask = jnp.where(is_discard, new_discard_mask.at[action].set(1), new_discard_mask)
     new_upcard = jnp.where(is_discard, jnp.int8(action), new_upcard)
 
-    # After discard, switch player and go to Draw phase
+    # Check for repeated move: discarding the same card just drawn from discard
+    # C++ logic: if upcard == prev_upcard (discarded same card drawn from discard):
+    #   - if repeated_move was already true: game ends as draw
+    #   - else: set repeated_move = true
+    # Otherwise: repeated_move = false
+    this_is_repeat = is_discard & (action == state['drawn_from_discard'])
+    both_repeated = this_is_repeat & state['repeated_move']  # Both players did it
+
+    # Update repeated_move flag for next turn
+    new_repeated_move = jnp.where(is_discard & this_is_repeat, True, new_repeated_move)
+    new_repeated_move = jnp.where(is_discard & ~this_is_repeat, False, new_repeated_move)
+
+    # After discard, switch player and go to Draw phase (unless both repeated or stock empty)
     stock_empty = ~jnp.any(new_stock_mask > 0)
-    new_phase = jnp.where(is_discard & stock_empty, jnp.int8(PHASE_GAME_OVER), new_phase)
-    new_phase = jnp.where(is_discard & ~stock_empty, jnp.int8(PHASE_DRAW), new_phase)
-    new_current_player = jnp.where(is_discard, jnp.int8(1 - player), new_current_player)
-    new_done = jnp.where(is_discard & stock_empty, True, new_done)
-    new_winner = jnp.where(is_discard & stock_empty, jnp.int8(2), new_winner)
+    # Both players repeated = game ends as draw
+    new_phase = jnp.where(is_discard & both_repeated, jnp.int8(PHASE_GAME_OVER), new_phase)
+    new_done = jnp.where(is_discard & both_repeated, True, new_done)
+    new_winner = jnp.where(is_discard & both_repeated, jnp.int8(2), new_winner)
+    # Stock empty also ends game
+    new_phase = jnp.where(is_discard & ~both_repeated & stock_empty, jnp.int8(PHASE_GAME_OVER), new_phase)
+    new_done = jnp.where(is_discard & ~both_repeated & stock_empty, True, new_done)
+    new_winner = jnp.where(is_discard & ~both_repeated & stock_empty, jnp.int8(2), new_winner)
+    # Normal case: continue to draw phase
+    new_phase = jnp.where(is_discard & ~both_repeated & ~stock_empty, jnp.int8(PHASE_DRAW), new_phase)
+    new_current_player = jnp.where(is_discard & ~both_repeated, jnp.int8(1 - player), new_current_player)
 
     # Handle Knock - proper deadwood with meld detection
     is_knock = (state['phase'] == PHASE_DISCARD) & (action == ACTION_KNOCK)
@@ -437,7 +477,8 @@ def step(state, action):
         'winner': new_winner,
         'p0_score': state['p0_score'],
         'p1_score': state['p1_score'],
-        'last_draw_from_discard': new_last_draw_from_discard,
+        'drawn_from_discard': new_drawn_from_discard,
+        'repeated_move': new_repeated_move,
         'pass_count': new_pass_count,
     }
 
