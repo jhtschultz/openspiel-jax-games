@@ -85,6 +85,8 @@ states = batched_step(states, actions)
 
 ## Gin Rummy: Current Status
 
+**Verified:** 100 random games match C++ OpenSpiel implementation (see `test_jax_vs_cpp.py`)
+
 ### What's Implemented ✓
 - Card dealing (internal RNG, no explicit chance nodes)
 - Game phases: FirstUpcard → Draw → Discard → (repeat)
@@ -93,15 +95,17 @@ states = batched_step(states, actions)
 - **Proper deadwood calculation** with exact meld detection
 - **Knock legality** (deadwood ≤ 10)
 - **Gin detection** (deadwood = 0)
-- Wall detection (draw when stock exhausted)
+- **Wall phase** (stock ≤ 2 cards → pass or knock only)
+- **FirstUpcard rules** (both pass → upcard to discard pile)
+- **Repeated move detection** (draw upcard + discard same → tracked, both players = draw)
 - OpenSpiel-compatible wrapper
 - Batched GPU simulation (~4k games/sec)
 
 ### What's Missing ✗
-- Layoff phase after knock
-- Undercut scoring (opponent beats knocker)
+- **Knock phase** (meld declarations after knock)
+- **Layoff phase** (opponent lays off cards onto knocker's melds)
+- Proper scoring (undercut bonus, gin bonus)
 - Oklahoma variant support
-- Big/Little Gin bonuses
 
 ### The Meld Problem (SOLVED!)
 
