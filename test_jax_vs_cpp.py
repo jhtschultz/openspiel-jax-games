@@ -95,6 +95,13 @@ def create_jax_state_from_hands(jax_game, p0_cards, p1_cards, upcard, stock_orde
         'drawn_from_discard': jnp.int8(-1),
         'repeated_move': jnp.bool_(False),
         'pass_count': jnp.int8(0),
+        # Knock/layoff state
+        'knocked': jnp.zeros(2, dtype=jnp.bool_),
+        'knocker': jnp.int8(-1),
+        'layed_melds': jnp.zeros((2, jax_gin.NUM_MELDS), dtype=jnp.bool_),
+        'layoffs_mask': jnp.zeros(52, dtype=jnp.bool_),
+        'finished_layoffs': jnp.bool_(False),
+        'deadwood': jnp.zeros(2, dtype=jnp.int32),
     }
 
     # Set stock mask for remaining cards
@@ -322,6 +329,64 @@ def analyze_phase_distribution(num_games=100):
     print(f"Games reaching wall: {wall_count}")
 
 
+def test_knock_game():
+    """Test a complete game with knock."""
+    import pyspiel
+
+    print("Testing knock game flow...")
+
+    jax_game = pyspiel.load_game("python_gin_rummy_jax")
+    state = jax_game.new_initial_state()
+
+    print(f"Initial state:\n{state}\n")
+
+    move_count = 0
+    knock_tested = False
+
+    while not state.is_terminal() and move_count < 300:
+        legal = state.legal_actions()
+        phase = int(state._jax_state['phase'])
+        player = state.current_player()
+
+        phase_names = ['Deal', 'FirstUpcard', 'Draw', 'Discard', 'Knock', 'Layoff', 'GameOver']
+
+        if phase == jax_gin.PHASE_KNOCK or phase == jax_gin.PHASE_LAYOFF:
+            print(f"Move {move_count}: Phase={phase_names[phase]}, Player={player}, Legal={legal}")
+
+        # If knock is available, use it
+        if 55 in legal and not knock_tested:  # ACTION_KNOCK
+            print(f"Move {move_count}: KNOCK available! Taking it...")
+            state.apply_action(55)
+            knock_tested = True
+        elif phase == jax_gin.PHASE_KNOCK:
+            # In knock phase, prefer pass if available (to finish laying melds)
+            if 54 in legal:  # ACTION_PASS
+                state.apply_action(54)
+            elif legal:
+                # Otherwise take first meld action or discard
+                state.apply_action(legal[0])
+        elif phase == jax_gin.PHASE_LAYOFF:
+            # In layoff phase, prefer pass
+            if 54 in legal:
+                state.apply_action(54)
+            elif legal:
+                state.apply_action(legal[0])
+        else:
+            # Random action
+            action = np.random.choice(legal)
+            state.apply_action(action)
+
+        move_count += 1
+
+    print(f"\nFinal state:\n{state}")
+    print(f"Game ended after {move_count} moves")
+    print(f"Returns: {state.returns()}")
+    print(f"Knocked: {state._jax_state['knocked']}")
+    print(f"Deadwood: {state._jax_state['deadwood']}")
+
+    return knock_tested
+
+
 if __name__ == "__main__":
     print("=== Comparing JAX vs C++ Gin Rummy ===\n")
 
@@ -350,3 +415,13 @@ if __name__ == "__main__":
             print(f"    cpp_state:\n{d.get('cpp_state_str', '')}")
     else:
         print("No disagreements found in basic game flow!")
+
+    print("\n3. Testing knock game flow:")
+    for i in range(5):
+        print(f"\n--- Knock Test Game {i+1} ---")
+        np.random.seed(i * 1000 + 42)
+        knocked = test_knock_game()
+        if knocked:
+            print("Successfully tested knock!")
+        else:
+            print("No knock opportunity arose in this game.")

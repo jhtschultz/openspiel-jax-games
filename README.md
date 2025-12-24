@@ -89,7 +89,7 @@ states = batched_step(states, actions)
 
 ### What's Implemented ✓
 - Card dealing (internal RNG, no explicit chance nodes)
-- Game phases: FirstUpcard → Draw → Discard → (repeat)
+- Game phases: FirstUpcard → Draw → Discard → Knock → Layoff → GameOver
 - Drawing from stock or discard pile
 - Discarding cards
 - **Proper deadwood calculation** with exact meld detection
@@ -98,21 +98,22 @@ states = batched_step(states, actions)
 - **Wall phase** (stock ≤ 2 cards → pass or knock only)
 - **FirstUpcard rules** (both pass → upcard to discard pile)
 - **Repeated move detection** (draw upcard + discard same → tracked, both players = draw)
+- **Knock phase** (discard if 11 cards, then lay melds, then pass)
+- **Layoff phase** (opponent can lay off cards onto knocker's melds, then lay own melds)
+- **Proper scoring** (opponent_deadwood - knocker_deadwood, gin bonus 25, undercut bonus 25)
 - OpenSpiel-compatible wrapper
 - Batched GPU simulation (~4k games/sec)
 
 ### What's Missing ✗
-- **Knock phase** (meld declarations after knock)
-- **Layoff phase** (opponent lays off cards onto knocker's melds)
-- Proper scoring (undercut bonus, gin bonus)
 - Oklahoma variant support
+- Strict legal meld/discard validation in knock phase (simplified to allow any valid meld)
 
 ### The Meld Problem (SOLVED!)
 
 The hardest part was calculating minimum deadwood - finding the optimal non-overlapping meld arrangement.
 
 **Solution:** Exhaustive search using matrix operations:
-1. Precompute all 329 possible melds (65 sets + 264 runs)
+1. Precompute all 185 possible melds (65 sets + 120 runs, matching C++ encoding)
 2. For each hand, find valid melds (~10-30)
 3. Use 2D matrix ops for pairs, 3D tensor for triples
 4. Maximum 3 melds (since 3+3+3=9 cards minimum)
