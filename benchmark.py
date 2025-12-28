@@ -53,6 +53,45 @@ def benchmark_standalone(batch_size=10000, n_steps=200, n_batches=5, fast=True):
     return rate
 
 
+def benchmark_simple_bot(batch_size=10000, n_steps=200, n_batches=5):
+    """Benchmark simple bot self-play."""
+    print(f"\n=== Simple Bot Benchmark (batch={batch_size}) ===")
+    print(f"Device: {jax.devices()[0]}")
+
+    @jax.jit
+    def run_batch(key):
+        keys = jax.random.split(key, batch_size)
+        states = jax.vmap(lambda _: gin.init_state())(keys)
+
+        def step_fn(i, carry):
+            states, keys = carry
+            def single(state, key):
+                a = gin.simple_bot_action(state)
+                ns = jax.lax.cond(state['done'], lambda: state, lambda: gin.step(state, a))
+                return ns, key
+            return jax.vmap(single)(states, keys)
+
+        final_states, _ = jax.lax.fori_loop(0, n_steps, step_fn, (states, keys))
+        return final_states['done']
+
+    print("Compiling...")
+    done = run_batch(jax.random.PRNGKey(0))
+    jax.block_until_ready(done)
+    print("Compiled!")
+
+    start = time.time()
+    for i in range(n_batches):
+        done = run_batch(jax.random.PRNGKey(i))
+    jax.block_until_ready(done)
+    elapsed = time.time() - start
+
+    total = n_batches * batch_size
+    rate = total / elapsed
+    print(f"{total:,} games in {elapsed:.2f}s = {rate:,.0f} games/sec")
+    print(f"Speedup vs C++ SimpleGinRummyBot (153 g/s): {rate/153:.1f}x")
+    return rate
+
+
 def verify_vs_cpp(n_games=50):
     """Verify JAX implementation matches C++ OpenSpiel."""
     print(f"\n=== Correctness Check vs C++ ({n_games} games) ===")
@@ -115,8 +154,8 @@ if __name__ == "__main__":
 
     if args.all:
         benchmark_standalone(batch_size=10000, fast=True)
-        benchmark_standalone(batch_size=10000, fast=False)
         benchmark_standalone(batch_size=100000, fast=True)
+        benchmark_simple_bot(batch_size=20000)  # Delta Lookups v3 optimal
         verify_vs_cpp()
     else:
         fast = not args.full

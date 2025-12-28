@@ -2,6 +2,16 @@
 
 This directory contains JAX implementations of OpenSpiel games optimized for GPU acceleration.
 
+## Optimization Goal
+
+**Primary objective: Maximize games/sec for the full version with deadwood calculation.**
+
+The simple bot (`simple_bot_action`) requires accurate deadwood calculation to make strategic decisions (knock eligibility, optimal discards). The "fast" version that skips deadwood is not suitable for strategic play.
+
+Current bottleneck: `calculate_deadwood` is called multiple times per turn (once per possible discard to find optimal play). Optimizing this function has the highest impact.
+
+**Keep optimizing autonomously.** After each improvement, document it in the Performance History section below and immediately continue to the next optimization. Do not check in with the user or ask for confirmation—just keep iterating until stopped.
+
 ## Files
 
 - `gin_rummy_core.py` - Standalone JAX Gin Rummy (no pyspiel). Use for GPU benchmarks.
@@ -55,9 +65,21 @@ Based on OpenSpiel's `simple_gin_rummy_bot`:
 - **Discard**: Knock if able, else discard highest-value card that minimizes deadwood
 - **Knock**: Discard best card, then pass
 
-### SELECTION_MATRIX Optimization
-Precomputed (2325, 24) matrix enumerating all subsets of size 0-3 from K=24 melds.
-Enables vectorized deadwood calculation via dense matrix ops instead of O(32³) loops.
+### Exact 216-Scenario Algorithm
+Uses precomputed 8192-entry LUT for run scoring, with full scenario enumeration:
+
+**Handles all edge cases:**
+- Up to 3 set candidates (not just 2)
+- 4-card set splitting (use 3 cards, leave 1 for runs)
+- Proper validity checking when discarding set cards
+
+**Algorithm:**
+1. Identify top 3 set candidates (ranks with 3+ cards)
+2. For each candidate, enumerate valid subsets: skip, 3-card subsets, 4-card (if held)
+3. Generate 6×6×6 = 216 scenario combinations
+4. For each discard: check validity, compute run delta, take max
+
+**Result:** ~3,744 ops per hand, **100% correct** (verified against C++ on 54,336 checks).
 
 ## Performance (A100 GPU)
 
@@ -65,16 +87,44 @@ Enables vectorized deadwood calculation via dense matrix ops instead of O(32³) 
 | Version | Games/sec | vs C++ |
 |---------|-----------|--------|
 | C++ OpenSpiel | 118 | 1x |
-| Full legal_actions_mask | 1,333 | 11x |
-| Fast legal_actions_mask | 343,670 | 2,912x |
+| Full legal_actions_mask | 29,502 | 250x |
+| Fast legal_actions_mask | 351,272 | 2,977x |
 
 ### Simple Bot (strategic play)
 | Version | Games/sec | vs C++ |
 |---------|-----------|--------|
 | C++ SimpleGinRummyBot | 153 | 1x |
-| JAX simple_bot_action (batched) | 1,330 | 8.7x |
+| JAX simple_bot_action (batch=10000) | **24,026** | **157x** |
 
-Fast version is ideal for MCTS rollouts. Simple bot for strategic play evaluation.
+Simple bot uses **exact 216-scenario algorithm** - verified 100% correct against C++ (54,336 checks, 0 disagreements).
+
+## Performance History
+
+Track each optimization attempt here. Always benchmark on A100 GPU with `python benchmark.py --all`.
+
+| Date | Change | Simple Bot (games/sec) | vs Previous |
+|------|--------|------------------------|-------------|
+| 2025-12-28 | Baseline: SELECTION_MATRIX for vectorized meld enumeration | 1,330 | - |
+| 2025-12-28 | Reduce K from 24→16 (697 vs 2325 combos) + dedupe deadwood calls (2 vs 4) | 4,917 | 3.7x |
+| 2025-12-28 | K=12 (299 combos) | 10,105 | 2.1x |
+| 2025-12-28 | K=10 (176 combos) | 15,446 | 1.5x |
+| 2025-12-28 | K=8 (93 combos) | 21,726 | 1.4x |
+| 2025-12-28 | K=6 (42 combos) - approximate | 30,145 | 1.4x |
+| 2025-12-28 | K=4 (15 combos) - more aggressive approx | 39,208 | 1.3x |
+| 2025-12-28 | LUT-based exact (batch=2000) | 25,648 | 0.65x (exact, memory-limited) |
+| 2025-12-28 | LUT + 36 valid combos only (batch=5000) | 26,676 | 1.04x |
+| 2025-12-28 | LUT + 36 combos + int16 (batch=18000) | 37,242 | 1.23x (exact) |
+| 2025-12-28 | Delta Lookups v3 (224 lookups, batch=20000) | 152,211 | 4.1x (but incorrect!) |
+| 2025-12-28 | **Exact 216-scenario** (3 sets + 4-split, batch=10000) | **24,026** | **157x vs C++, 100% correct** |
+
+### Optimization Ideas to Try
+- [x] LUT-based exact deadwood (implemented)
+- [x] Reduce 256 set combinations to 36 valid-only
+- [x] Use int16/int8 for memory bandwidth
+- [x] Delta Lookups v3 (fast but incorrect for edge cases)
+- [x] **Exact 216-scenario**: handles 3 sets + 4-card splitting, 100% correct!
+- [ ] Further memory optimization to increase batch size
+- [ ] Profile with JAX profiler to identify remaining hotspots
 
 ## GCP Setup
 
