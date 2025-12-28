@@ -1,14 +1,19 @@
 """JAX-accelerated Gin Rummy for OpenSpiel.
 
-This implements Gin Rummy with a JAX core for fast batched simulation,
-wrapped in an OpenSpiel-compatible Python game interface.
+This implements Gin Rummy matching the C++ OpenSpiel implementation exactly,
+including explicit chance nodes for dealing and stock draws.
 
-Card encoding: 0-51 where card = rank * 4 + suit
-  Ranks: A=0, 2=1, ..., K=12
+Card encoding (matching C++): 0-51 where card = suit * 13 + rank
   Suits: spades=0, clubs=1, diamonds=2, hearts=3
+  Ranks: A=0, 2=1, ..., K=12
+
+  Cards 0-12: spades (As, 2s, ..., Ks)
+  Cards 13-25: clubs (Ac, 2c, ..., Kc)
+  Cards 26-38: diamonds (Ad, 2d, ..., Kd)
+  Cards 39-51: hearts (Ah, 2h, ..., Kh)
 """
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -16,77 +21,95 @@ from functools import partial
 import pyspiel
 
 # =============================================================================
-# Constants
+# Constants (matching C++)
 # =============================================================================
 NUM_CARDS = 52
 NUM_RANKS = 13
 NUM_SUITS = 4
 HAND_SIZE = 10
-MAX_DECK_SIZE = 52
 KNOCK_THRESHOLD = 10
+GIN_BONUS = 25
+UNDERCUT_BONUS = 25
 
 # Card point values (A=1, 2-9=face, 10/J/Q/K=10)
 CARD_POINTS = jnp.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10], dtype=jnp.int32)
 
-# Game phases
-PHASE_DEAL = 0
+# Game phases (matching C++ Phase enum)
+PHASE_DEAL = 0        # Chance node: dealing cards
 PHASE_FIRST_UPCARD = 1
 PHASE_DRAW = 2
 PHASE_DISCARD = 3
 PHASE_KNOCK = 4
 PHASE_LAYOFF = 5
-PHASE_GAME_OVER = 6
+PHASE_WALL = 6        # Added: explicit wall phase
+PHASE_GAME_OVER = 7
 
-# Actions
+# Limits (matching C++)
+MAX_NUM_DRAW_UPCARD_ACTIONS = 50
+WALL_STOCK_SIZE = 2  # When stock <= this, enter wall phase
+
+# Actions (matching C++)
+# 0-51: card actions (deal in chance nodes, discard in regular play)
 ACTION_DRAW_UPCARD = 52
 ACTION_DRAW_STOCK = 53
 ACTION_PASS = 54
 ACTION_KNOCK = 55
-# Actions 56-240 are meld declarations (we'll compute these)
+ACTION_MELD_BASE = 56
+# Actions 56-240 are meld declarations (185 melds)
 
-NUM_ACTIONS = 241  # 0-51 cards, 52-55 special, 56-240 melds (185 melds)
+NUM_MELDS = 185
+NUM_ACTIONS = 241  # 0-51 cards, 52-55 special, 56-240 melds
+
+# Special player IDs
+CHANCE_PLAYER = -1
+TERMINAL_PLAYER = -4
 
 # =============================================================================
-# Meld encoding
+# Meld encoding (same as before - this part is correct)
 # =============================================================================
-# Melds are combinations of 3+ cards that form sets (same rank) or runs (consecutive same suit)
-# We pre-compute all possible melds
+
+def card_rank(card):
+    """Get rank (0-12) from card using C++ encoding: card = suit * 13 + rank."""
+    return card % NUM_RANKS
+
+def card_suit(card):
+    """Get suit (0-3) from card using C++ encoding: card = suit * 13 + rank."""
+    return card // NUM_RANKS
+
+def make_card(suit, rank):
+    """Create card from suit and rank using C++ encoding."""
+    return suit * NUM_RANKS + rank
+
 
 def generate_all_melds():
     """Generate all valid melds (sets and runs).
 
     Matches C++ encoding: 185 melds total
-    - 65 rank melds (sets): 52 three-of-a-kind + 13 four-of-a-kind
-    - 120 suit melds (runs): 44 size-3 + 40 size-4 + 36 size-5
-
-    C++ MeldToInt encoding:
-    - Rank meld size 3: rank * 5 + missing_suit (0-51)
-    - Rank meld size 4: rank * 5 + 4 (52-64)
-    - Suit meld size 3: 65 + suit * 11 + start_rank (65-108)
-    - Suit meld size 4: 109 + suit * 10 + start_rank (109-148)
-    - Suit meld size 5: 149 + suit * 9 + start_rank (149-184)
+    Card encoding: card = suit * 13 + rank
     """
-    melds = [None] * 185  # Pre-allocate to match C++ indexing
+    melds = [None] * 185
 
     # Rank melds (sets) - indices 0-64
+    # Same rank, different suits
     for rank in range(NUM_RANKS):
         # Size 3: missing one suit
         for missing_suit in range(NUM_SUITS):
             meld_id = rank * 5 + missing_suit
-            cards = tuple(rank * NUM_SUITS + s for s in range(NUM_SUITS) if s != missing_suit)
+            cards = tuple(make_card(s, rank) for s in range(NUM_SUITS) if s != missing_suit)
             melds[meld_id] = cards
         # Size 4: all suits
         meld_id = rank * 5 + 4
-        cards = tuple(rank * NUM_SUITS + s for s in range(NUM_SUITS))
+        cards = tuple(make_card(s, rank) for s in range(NUM_SUITS))
         melds[meld_id] = cards
 
     # Suit melds (runs) - indices 65-184
+    # Same suit, consecutive ranks
     offset = 65
     # Size 3 runs: 11 per suit (start ranks 0-10)
     for suit in range(NUM_SUITS):
         for start_rank in range(NUM_RANKS - 2):  # 0-10
             meld_id = offset + suit * 11 + start_rank
-            cards = tuple(r * NUM_SUITS + suit for r in range(start_rank, start_rank + 3))
+            cards = tuple(make_card(suit, r) for r in range(start_rank, start_rank + 3))
             melds[meld_id] = cards
 
     offset = 109  # 65 + 44
@@ -94,7 +117,7 @@ def generate_all_melds():
     for suit in range(NUM_SUITS):
         for start_rank in range(NUM_RANKS - 3):  # 0-9
             meld_id = offset + suit * 10 + start_rank
-            cards = tuple(r * NUM_SUITS + suit for r in range(start_rank, start_rank + 4))
+            cards = tuple(make_card(suit, r) for r in range(start_rank, start_rank + 4))
             melds[meld_id] = cards
 
     offset = 149  # 109 + 40
@@ -102,17 +125,14 @@ def generate_all_melds():
     for suit in range(NUM_SUITS):
         for start_rank in range(NUM_RANKS - 4):  # 0-8
             meld_id = offset + suit * 9 + start_rank
-            cards = tuple(r * NUM_SUITS + suit for r in range(start_rank, start_rank + 5))
+            cards = tuple(make_card(suit, r) for r in range(start_rank, start_rank + 5))
             melds[meld_id] = cards
 
     return melds
 
 ALL_MELDS = generate_all_melds()
-NUM_MELDS = len(ALL_MELDS)
 
-# Create meld lookup: action 56 + meld_idx
 def meld_to_mask(meld):
-    """Convert meld tuple to 52-bit mask."""
     mask = np.zeros(NUM_CARDS, dtype=np.int8)
     for card in meld:
         mask[card] = 1
@@ -122,231 +142,318 @@ MELD_MASKS = jnp.array([meld_to_mask(m) for m in ALL_MELDS], dtype=jnp.int8)
 
 
 # =============================================================================
-# Card utilities
+# Deadwood calculation (keeping the existing correct implementation)
 # =============================================================================
 
-def card_rank(card):
-    """Get rank (0-12) from card (0-51)."""
-    return card // NUM_SUITS
+# Precompute meld overlap matrix
+def _compute_overlap_matrix():
+    overlap = np.zeros((NUM_MELDS, NUM_MELDS), dtype=np.bool_)
+    for i in range(NUM_MELDS):
+        for j in range(NUM_MELDS):
+            # A meld overlaps with itself (can't use same meld twice)
+            if i == j:
+                overlap[i, j] = True
+            else:
+                set_i = set(ALL_MELDS[i])
+                set_j = set(ALL_MELDS[j])
+                if set_i & set_j:
+                    overlap[i, j] = True
+    return jnp.array(overlap)
 
+MELD_OVERLAP = _compute_overlap_matrix()
 
-def card_suit(card):
-    """Get suit (0-3) from card (0-51)."""
-    return card % NUM_SUITS
+def _compute_meld_points():
+    points = np.zeros(NUM_MELDS, dtype=np.int32)
+    for i, meld in enumerate(ALL_MELDS):
+        for card in meld:
+            rank = card % NUM_RANKS  # C++ encoding
+            points[i] += int(CARD_POINTS[rank])
+    return jnp.array(points)
 
-
-def card_points_fn(card):
-    """Get point value of a card."""
-    return CARD_POINTS[card_rank(card)]
-
+MELD_POINTS = _compute_meld_points()
 
 # =============================================================================
-# Deadwood calculation (the heart of Gin Rummy scoring)
+# Vectorized meld combination search (K=24 max melds)
 # =============================================================================
 
-# Precompute meld overlap matrix (1 = overlapping, 0 = compatible)
-# Vectorized: two melds overlap if they share any card
-_meld_masks_np = np.array(MELD_MASKS)  # Convert once to numpy
-_meld_overlap = np.zeros((NUM_MELDS, NUM_MELDS), dtype=np.int8)
-for _i in range(NUM_MELDS):
-    for _j in range(NUM_MELDS):
-        _meld_overlap[_i, _j] = 1 if np.any(_meld_masks_np[_i] & _meld_masks_np[_j]) else 0
-MELD_OVERLAP = jnp.array(_meld_overlap)
-MELD_COMPAT = 1 - MELD_OVERLAP
+MAX_MELDS_IN_HAND = 24  # Max possible melds in an 11-card hand
 
-# Precompute meld point values
-MELD_POINTS = jnp.array([
-    sum(int(CARD_POINTS[c // NUM_SUITS]) for c in meld)
-    for meld in ALL_MELDS
-], dtype=jnp.int32)
+def _generate_selection_matrix(k):
+    """Generate all subsets of size 0, 1, 2, 3 from k elements.
 
-# Max valid melds per hand (for static sizing in JAX)
-MAX_VALID_MELDS = 32
-
-
-@jax.jit
-def hand_total_points(hand_mask):
-    """Calculate total points of all cards in hand."""
-    card_pts = CARD_POINTS[jnp.arange(NUM_CARDS) // NUM_SUITS]
-    return jnp.sum(hand_mask * card_pts)
-
-
-@jax.jit
-def valid_melds_mask(hand_mask):
-    """Return boolean mask of which melds are valid for this hand."""
-    return jnp.all(MELD_MASKS <= hand_mask, axis=1)
-
-
-@jax.jit
-def calculate_deadwood(hand_mask):
+    Returns a binary matrix where each row is a subset selection.
+    For k=24: 1 + 24 + 276 + 2024 = 2325 rows.
     """
-    Calculate minimum deadwood using optimized matrix operations.
+    from itertools import combinations
 
-    Uses exhaustive search over all combinations of 1, 2, 3 non-overlapping melds.
-    Optimized for GPU with full matrix operations.
+    subsets = []
+    # Size 0: empty set
+    subsets.append([0] * k)
+    # Size 1
+    for i in range(k):
+        row = [0] * k
+        row[i] = 1
+        subsets.append(row)
+    # Size 2
+    for i, j in combinations(range(k), 2):
+        row = [0] * k
+        row[i] = 1
+        row[j] = 1
+        subsets.append(row)
+    # Size 3
+    for i, j, l in combinations(range(k), 3):
+        row = [0] * k
+        row[i] = 1
+        row[j] = 1
+        row[l] = 1
+        subsets.append(row)
+
+    return np.array(subsets, dtype=np.int8)
+
+SELECTION_MATRIX = jnp.array(_generate_selection_matrix(MAX_MELDS_IN_HAND))
+NUM_COMBOS = SELECTION_MATRIX.shape[0]  # 2325 for K=24
+
+
+@jax.jit
+def hand_total_points(hand):
+    """Calculate total point value of all cards in hand.
+
+    Uses C++ encoding: card = suit * 13 + rank, so rank = card % 13
     """
-    total_points = hand_total_points(hand_mask)
-    valid = valid_melds_mask(hand_mask)
+    card_vals = jnp.zeros(NUM_CARDS, dtype=jnp.int32)
+    for i in range(NUM_CARDS):
+        rank = i % NUM_RANKS  # C++ encoding
+        card_vals = card_vals.at[i].set(CARD_POINTS[rank])
+    return jnp.sum(hand * card_vals)
 
-    # No melds = all deadwood
-    best_savings = jnp.int32(0)
 
-    # Get indices of valid melds, padded with index 0
-    valid_indices = jnp.where(valid, size=MAX_VALID_MELDS, fill_value=0)[0]
-    num_valid = jnp.sum(valid)
-    valid_mask = jnp.arange(MAX_VALID_MELDS) < num_valid
+@jax.jit
+def valid_melds_mask(hand):
+    """Return mask of which melds are valid for this hand."""
+    hand_expanded = hand[None, :]
+    meld_card_counts = jnp.sum(MELD_MASKS * hand_expanded, axis=1)
+    meld_sizes = jnp.sum(MELD_MASKS, axis=1)
+    return meld_card_counts == meld_sizes
 
-    # Get properties for valid melds
-    v_points = MELD_POINTS[valid_indices]
 
-    # === Single melds: vectorized max ===
-    single_savings = jnp.where(valid_mask, v_points, 0)
-    best_savings = jnp.maximum(best_savings, jnp.max(single_savings))
+@jax.jit
+def calculate_deadwood(hand):
+    """Calculate minimum deadwood for a hand using exhaustive meld search."""
+    total_points = hand_total_points(hand)
+    valid = valid_melds_mask(hand)
+    v_points = jnp.where(valid, MELD_POINTS, 0)
 
-    # === Build compatibility matrix for valid melds ===
-    v_compat = MELD_COMPAT[valid_indices][:, valid_indices]
+    # Find valid meld indices (up to 32)
+    valid_indices = jnp.where(valid, size=32, fill_value=0)[0]
+    n_valid = jnp.sum(valid.astype(jnp.int32))
 
-    # === Pairs: matrix operations ===
-    upper_tri_2 = jnp.triu(jnp.ones((MAX_VALID_MELDS, MAX_VALID_MELDS), dtype=jnp.bool_), k=1)
-    valid_pair = (valid_mask[:, None] & valid_mask[None, :] &
-                  v_compat.astype(jnp.bool_) & upper_tri_2)
-    pair_savings = jnp.where(valid_pair, v_points[:, None] + v_points[None, :], 0)
-    best_savings = jnp.maximum(best_savings, jnp.max(pair_savings))
+    # Single meld savings
+    best_single = jnp.max(v_points)
 
-    # === Triples: 3D tensor operations ===
-    idx = jnp.arange(MAX_VALID_MELDS)
-    i_lt_j = idx[:, None, None] < idx[None, :, None]
-    j_lt_k = idx[None, :, None] < idx[None, None, :]
-    upper_tri_3 = i_lt_j & j_lt_k
+    # Pairs of non-overlapping melds
+    v_overlap = MELD_OVERLAP[valid_indices][:, valid_indices]
+    v_pts = v_points[valid_indices]
+    valid_pair = ~v_overlap
+    pair_savings = jnp.where(valid_pair, v_pts[:, None] + v_pts[None, :], 0)
+    best_pair = jnp.max(pair_savings)
 
-    all_valid = (valid_mask[:, None, None] &
-                 valid_mask[None, :, None] &
-                 valid_mask[None, None, :])
+    # Triples
+    ov = v_overlap
+    valid_triple = ~ov[:, None, :] & ~ov[None, :, :] & ~ov[:, :, None]
+    valid_triple = valid_triple & (jnp.arange(32)[:, None, None] < jnp.arange(32)[None, :, None])
+    valid_triple = valid_triple & (jnp.arange(32)[None, :, None] < jnp.arange(32)[None, None, :])
 
-    compat_ij = v_compat[:, :, None].astype(jnp.bool_)
-    compat_ik = v_compat[:, None, :].astype(jnp.bool_)
-    compat_jk = v_compat[None, :, :].astype(jnp.bool_)
-    all_compat = compat_ij & compat_ik & compat_jk
-
-    valid_triple = all_valid & all_compat & upper_tri_3
     triple_savings = jnp.where(
         valid_triple,
-        v_points[:, None, None] + v_points[None, :, None] + v_points[None, None, :],
+        v_pts[:, None, None] + v_pts[None, :, None] + v_pts[None, None, :],
         0
     )
-    best_savings = jnp.maximum(best_savings, jnp.max(triple_savings))
+    best_triple = jnp.max(triple_savings)
 
-    return jnp.maximum(total_points - best_savings, 0)
-
-
-# Batched version for GPU efficiency
-batched_deadwood = jax.vmap(calculate_deadwood)
-
-
-# =============================================================================
-# JAX State Representation
-# =============================================================================
-
-@jax.jit
-def init_state(rng_key):
-    """Initialize a new game state with shuffled deck."""
-    # Shuffle deck
-    deck_order = jax.random.permutation(rng_key, NUM_CARDS)
-
-    # Deal 10 cards to each player, 1 upcard
-    player0_hand = jnp.zeros(NUM_CARDS, dtype=jnp.int8)
-    player1_hand = jnp.zeros(NUM_CARDS, dtype=jnp.int8)
-
-    # First 10 cards to player 0
-    for i in range(HAND_SIZE):
-        player0_hand = player0_hand.at[deck_order[i]].set(1)
-    # Next 10 to player 1
-    for i in range(HAND_SIZE, 2 * HAND_SIZE):
-        player1_hand = player1_hand.at[deck_order[i]].set(1)
-
-    # Card 21 is initial upcard
-    upcard = deck_order[2 * HAND_SIZE]
-
-    # Remaining cards form stock
-    stock_mask = jnp.zeros(NUM_CARDS, dtype=jnp.int8)
-    for i in range(2 * HAND_SIZE + 1, NUM_CARDS):
-        stock_mask = stock_mask.at[deck_order[i]].set(1)
-
-    return {
-        'player0_hand': player0_hand,
-        'player1_hand': player1_hand,
-        'stock_mask': stock_mask,
-        'discard_mask': jnp.zeros(NUM_CARDS, dtype=jnp.int8),
-        'upcard': jnp.int8(upcard),
-        'stock_top_idx': jnp.int8(0),  # Index into shuffled stock order
-        'stock_order': deck_order[2 * HAND_SIZE + 1:],  # Order of stock cards
-        'current_player': jnp.int8(0),
-        'phase': jnp.int8(PHASE_FIRST_UPCARD),
-        'done': jnp.bool_(False),
-        'winner': jnp.int8(-1),  # -1=ongoing, 0=p0, 1=p1, 2=draw
-        'p0_score': jnp.int32(0),
-        'p1_score': jnp.int32(0),
-        'drawn_from_discard': jnp.int8(-1),  # Card drawn from discard (-1 if none/stock)
-        'repeated_move': jnp.bool_(False),  # True if prev player drew upcard and discarded it back
-        'pass_count': jnp.int8(0),  # For first upcard phase
-        # Knock/layoff state
-        'knocked': jnp.zeros(2, dtype=jnp.bool_),  # knocked[i] = True if player i knocked
-        'knocker': jnp.int8(-1),  # Which player knocked (-1 = no one)
-        'layed_melds': jnp.zeros((2, NUM_MELDS), dtype=jnp.bool_),  # layed_melds[player, meld_id]
-        'layoffs_mask': jnp.zeros(NUM_CARDS, dtype=jnp.bool_),  # Cards laid off onto knocker's melds
-        'finished_layoffs': jnp.bool_(False),  # True after opponent finishes laying off cards
-        'deadwood': jnp.zeros(2, dtype=jnp.int32),  # Current deadwood for each player
-    }
+    best_savings = jnp.maximum(jnp.maximum(best_single, best_pair), best_triple)
+    return total_points - best_savings
 
 
 @jax.jit
-def get_hand(state, player):
-    """Get hand mask for a player."""
-    return jnp.where(player == 0, state['player0_hand'], state['player1_hand'])
+def calculate_deadwood_all_discards(hand):
+    """Calculate deadwood for all 52 possible discards using vectorized search.
+
+    Uses precomputed SELECTION_MATRIX to enumerate all meld combinations
+    efficiently via dense matrix operations. No branching or variable shapes.
+
+    Returns: (52,) array of deadwood values after discarding each card.
+             Cards not in hand get deadwood = 999 (invalid).
+    """
+    # Card point values
+    card_values = jnp.array([CARD_POINTS[i % NUM_RANKS] for i in range(NUM_CARDS)])
+    total_hand_points = jnp.sum(hand * card_values)
+
+    # Step 1: Find valid melds for full 11-card hand
+    is_valid = valid_melds_mask(hand)  # (185,) bool
+
+    # Step 2: Select top K=24 melds by (validity, points)
+    # Sort by validity (True first) then by points (descending)
+    # Use negative points so that argsort gives highest first among valid
+    sort_key = jnp.where(is_valid, -MELD_POINTS, 1000)
+    top_k_indices = jnp.argsort(sort_key)[:MAX_MELDS_IN_HAND]  # (24,)
+
+    # Get masks and properties for top K melds
+    top_k_masks = MELD_MASKS[top_k_indices]  # (24, 52)
+    top_k_valid = is_valid[top_k_indices]    # (24,) bool
+    top_k_points = MELD_POINTS[top_k_indices]  # (24,)
+
+    # Step 3: Compute card usage for all 2325 combinations
+    # SELECTION_MATRIX: (2325, 24) binary - which melds to include
+    # card_usage: (2325, 52) - count of how many times each card is used
+    card_usage = jnp.dot(SELECTION_MATRIX, top_k_masks)  # (2325, 52)
+
+    # Step 4: Check disjointness (no card used twice)
+    is_disjoint = jnp.all(card_usage <= 1, axis=1)  # (2325,)
+
+    # Step 5: Check all selected melds are valid
+    # Count how many valid melds each combo selected
+    selected_valid_count = jnp.dot(SELECTION_MATRIX, top_k_valid.astype(jnp.int32))  # (2325,)
+    selected_total_count = jnp.sum(SELECTION_MATRIX, axis=1)  # (2325,)
+    all_selected_valid = (selected_valid_count == selected_total_count)  # (2325,)
+
+    # Combined validity for each combo
+    combo_valid = is_disjoint & all_selected_valid  # (2325,)
+
+    # Step 6: Compute meld points for each combo
+    combo_points = jnp.dot(SELECTION_MATRIX, top_k_points)  # (2325,)
+
+    # Step 7: For all 52 discards at once
+    # A combo is valid for discard c if: combo_valid AND combo doesn't use card c
+    card_not_used = (card_usage == 0)  # (2325, 52) bool
+    valid_for_discard = combo_valid[:, None] & card_not_used  # (2325, 52)
+
+    # Find best meld points for each discard
+    # Set invalid combos to -inf so they don't win the max
+    combo_points_expanded = combo_points[:, None]  # (2325, 1)
+    masked_points = jnp.where(valid_for_discard, combo_points_expanded, -1)  # (2325, 52)
+    best_meld_points = jnp.max(masked_points, axis=0)  # (52,)
+
+    # Compute deadwood for each discard
+    # deadwood = (total_hand_points - card_value) - best_meld_points
+    deadwood = (total_hand_points - card_values) - best_meld_points  # (52,)
+
+    # Mask out cards not in hand
+    deadwood = jnp.where(hand > 0, deadwood, 999)
+
+    return deadwood
 
 
 @jax.jit
-def set_hand(state, player, hand):
-    """Set hand for a player."""
-    new_p0 = jnp.where(player == 0, hand, state['player0_hand'])
-    new_p1 = jnp.where(player == 1, hand, state['player1_hand'])
-    return {**state, 'player0_hand': new_p0, 'player1_hand': new_p1}
+def min_deadwood_after_discard(hand):
+    """Calculate minimum deadwood after optimal discard (for 11-card hands).
+
+    This matches C++ behavior exactly:
+    1. Find best melds for all 11 cards
+    2. Compute which cards are deadwood (not in melds)
+    3. Discard the highest-value deadwood card
+    4. Return sum of remaining deadwood
+
+    This is different from trying every discard - we only discard from deadwood.
+    """
+    hand_count = jnp.sum(hand)
+
+    # For 10-card hands, just return regular deadwood
+    regular_deadwood = calculate_deadwood(hand)
+
+    # For 11-card hands: find best melds, then discard highest deadwood
+    # First, find which melds are valid and compute best meld set
+    valid = valid_melds_mask(hand)
+    v_points = jnp.where(valid, MELD_POINTS, 0)
+
+    # Find valid meld indices (up to 32)
+    valid_indices = jnp.where(valid, size=32, fill_value=0)[0]
+
+    # Find best non-overlapping melds (same logic as calculate_deadwood)
+    v_overlap = MELD_OVERLAP[valid_indices][:, valid_indices]
+    v_pts = v_points[valid_indices]
+
+    # Best single meld
+    best_single_idx = jnp.argmax(v_pts)
+
+    # Best pair
+    valid_pair = ~v_overlap
+    pair_savings = jnp.where(valid_pair, v_pts[:, None] + v_pts[None, :], 0)
+    best_pair_flat = jnp.argmax(pair_savings.flatten())
+    best_pair_i, best_pair_j = best_pair_flat // 32, best_pair_flat % 32
+
+    # Best triple
+    ov = v_overlap
+    valid_triple = ~ov[:, None, :] & ~ov[None, :, :] & ~ov[:, :, None]
+    valid_triple = valid_triple & (jnp.arange(32)[:, None, None] < jnp.arange(32)[None, :, None])
+    valid_triple = valid_triple & (jnp.arange(32)[None, :, None] < jnp.arange(32)[None, None, :])
+    triple_savings = jnp.where(
+        valid_triple,
+        v_pts[:, None, None] + v_pts[None, :, None] + v_pts[None, None, :],
+        0
+    )
+    best_triple_flat = jnp.argmax(triple_savings.flatten())
+    best_triple_i = best_triple_flat // (32 * 32)
+    best_triple_j = (best_triple_flat // 32) % 32
+    best_triple_k = best_triple_flat % 32
+
+    # Determine which configuration is best
+    single_val = v_pts[best_single_idx]
+    pair_val = jnp.max(pair_savings)
+    triple_val = jnp.max(triple_savings)
+    best_is_single = (single_val >= pair_val) & (single_val >= triple_val) & (single_val > 0)
+    best_is_pair = (pair_val > single_val) & (pair_val >= triple_val)
+    best_is_triple = (triple_val > single_val) & (triple_val > pair_val)
+
+    # Build mask of cards in best melds
+    meld_cards = jnp.zeros(NUM_CARDS, dtype=jnp.int8)
+    # Single meld
+    meld_cards = jnp.where(best_is_single, meld_cards | MELD_MASKS[valid_indices[best_single_idx]], meld_cards)
+    # Pair melds
+    meld_cards = jnp.where(best_is_pair, meld_cards | MELD_MASKS[valid_indices[best_pair_i]] | MELD_MASKS[valid_indices[best_pair_j]], meld_cards)
+    # Triple melds
+    meld_cards = jnp.where(best_is_triple, meld_cards | MELD_MASKS[valid_indices[best_triple_i]] | MELD_MASKS[valid_indices[best_triple_j]] | MELD_MASKS[valid_indices[best_triple_k]], meld_cards)
+
+    # Deadwood cards = in hand but not in melds
+    deadwood_cards = hand & ~meld_cards
+
+    # Find highest value deadwood card to discard
+    card_values = jnp.array([CARD_POINTS[i % NUM_RANKS] for i in range(NUM_CARDS)])
+    deadwood_values = jnp.where(deadwood_cards > 0, card_values, -1)
+    highest_deadwood_idx = jnp.argmax(deadwood_values)
+    highest_deadwood_val = deadwood_values[highest_deadwood_idx]
+
+    # Total deadwood = sum of all deadwood values minus the discarded card
+    total_deadwood = jnp.sum(deadwood_cards * card_values)
+    deadwood_after_discard = total_deadwood - jnp.maximum(highest_deadwood_val, 0)
+
+    # Return for 11 cards; regular for 10
+    return jnp.where(hand_count == 11, deadwood_after_discard, regular_deadwood)
 
 
 # =============================================================================
-# Knock/Layoff Helper Functions
+# Meld layoff helpers
 # =============================================================================
 
-# Precompute meld type info
 def _compute_meld_info():
-    """Compute meld type and extension info for layoffs."""
     is_rank_meld = np.zeros(NUM_MELDS, dtype=np.bool_)
     is_suit_meld = np.zeros(NUM_MELDS, dtype=np.bool_)
-    meld_size = np.zeros(NUM_MELDS, dtype=np.int8)
 
     for meld_id, meld in enumerate(ALL_MELDS):
-        meld_size[meld_id] = len(meld)
         if meld is None:
             continue
-        # Check if rank meld (all same rank)
-        ranks = [c // NUM_SUITS for c in meld]
+        # C++ encoding: rank = card % 13
+        ranks = [c % NUM_RANKS for c in meld]
         if len(set(ranks)) == 1:
             is_rank_meld[meld_id] = True
         else:
             is_suit_meld[meld_id] = True
 
-    return jnp.array(is_rank_meld), jnp.array(is_suit_meld), jnp.array(meld_size)
+    return jnp.array(is_rank_meld), jnp.array(is_suit_meld)
 
-IS_RANK_MELD, IS_SUIT_MELD, MELD_SIZE = _compute_meld_info()
-
-# Meld action offset
-ACTION_MELD_BASE = 56
+IS_RANK_MELD, IS_SUIT_MELD = _compute_meld_info()
 
 
-# Precompute layoff extension info for each meld
 def _compute_meld_layoff_info():
-    """Precompute which cards can extend each meld."""
-    # For each meld, which cards can be laid off onto it
     layoff_cards = np.zeros((NUM_MELDS, NUM_CARDS), dtype=np.bool_)
 
     for meld_id, meld in enumerate(ALL_MELDS):
@@ -354,22 +461,22 @@ def _compute_meld_layoff_info():
             continue
 
         if IS_RANK_MELD[meld_id]:
-            # For 3-of-a-kind, the 4th card can be laid off
+            # Rank meld (set): same rank, different suits
             if len(meld) == 3:
-                rank = meld[0] // NUM_SUITS
+                rank = meld[0] % NUM_RANKS  # C++ encoding
                 for suit in range(NUM_SUITS):
-                    card = rank * NUM_SUITS + suit
+                    card = make_card(suit, rank)
                     if card not in meld:
                         layoff_cards[meld_id, card] = True
         else:
-            # IS_SUIT_MELD - for runs, can extend at either end
-            suit = meld[0] % NUM_SUITS
-            ranks = sorted([c // NUM_SUITS for c in meld])
+            # Suit meld (run): same suit, consecutive ranks
+            suit = meld[0] // NUM_RANKS  # C++ encoding
+            ranks = sorted([c % NUM_RANKS for c in meld])
             min_rank, max_rank = ranks[0], ranks[-1]
             if min_rank > 0:
-                layoff_cards[meld_id, (min_rank - 1) * NUM_SUITS + suit] = True
+                layoff_cards[meld_id, make_card(suit, min_rank - 1)] = True
             if max_rank < NUM_RANKS - 1:
-                layoff_cards[meld_id, (max_rank + 1) * NUM_SUITS + suit] = True
+                layoff_cards[meld_id, make_card(suit, max_rank + 1)] = True
 
     return jnp.array(layoff_cards)
 
@@ -378,123 +485,224 @@ MELD_LAYOFF_CARDS = _compute_meld_layoff_info()
 
 @jax.jit
 def compute_layoff_cards(layed_melds_mask, layoffs_mask):
-    """Compute which cards can be laid off onto the knocker's melds.
+    """Compute valid layoff cards from the knocker's laid melds, including run extensions.
 
-    For rank melds of size 3: the 4th card of same rank can be laid off
-    For suit melds: cards that extend the run at either end
-
-    Uses precomputed lookup tables for JIT compatibility.
+    When a card is laid off onto a run, it extends the run, creating new layoff opportunities.
+    For example: if 2-3-4♠ is a meld and 5♠ is laid off, now 6♠ is also valid.
+    Sets (rank melds) don't extend - once they have 4 cards, they're full.
     """
-    # For each meld that's laid, OR in its possible layoff cards
-    # Shape: (NUM_MELDS, NUM_CARDS) * (NUM_MELDS, 1) -> (NUM_MELDS, NUM_CARDS)
-    meld_contributions = MELD_LAYOFF_CARDS * layed_melds_mask[:, None]
-    # OR across all melds -> (NUM_CARDS,)
-    possible = jnp.any(meld_contributions, axis=0)
-    return possible
+    # Base layoffs from original melds
+    base_layoffs = jnp.any(MELD_LAYOFF_CARDS * layed_melds_mask[:, None], axis=0)
+
+    # Only consider extensions for cards laid off onto RUN melds (suit melds)
+    # First, find which base layoffs came from run melds (not set melds)
+    run_meld_layoffs = jnp.any(MELD_LAYOFF_CARDS * (layed_melds_mask & IS_SUIT_MELD)[:, None], axis=0)
+
+    def extend_once(extended, _):
+        """One iteration of run extension."""
+        # Only extend cards that were both laid off AND were layoffs for run melds
+        just_extended = extended & layoffs_mask & run_meld_layoffs
+        ext_2d = just_extended.reshape(NUM_SUITS, NUM_RANKS)
+
+        # High extension: rank+1 valid if rank was extended (shift right, clear first col)
+        high_ext = jnp.roll(ext_2d, 1, axis=1).at[:, 0].set(False)
+
+        # Low extension: rank-1 valid if rank was extended (shift left, clear last col)
+        low_ext = jnp.roll(ext_2d, -1, axis=1).at[:, -1].set(False)
+
+        return extended | (high_ext | low_ext).flatten(), None
+
+    # Iterate extension up to 10 times (max practical run extension depth)
+    extended, _ = jax.lax.scan(extend_once, base_layoffs, None, length=10)
+
+    return extended
 
 
 # =============================================================================
-# Legal Actions
+# JAX State Representation - V2 with explicit chance nodes
 # =============================================================================
 
 @jax.jit
+def init_state():
+    """Initialize a new game state ready for dealing (chance nodes)."""
+    return {
+        # Card locations
+        'player0_hand': jnp.zeros(NUM_CARDS, dtype=jnp.int8),
+        'player1_hand': jnp.zeros(NUM_CARDS, dtype=jnp.int8),
+        'deck': jnp.ones(NUM_CARDS, dtype=jnp.int8),  # All cards in deck initially
+        'discard_pile': jnp.zeros(NUM_CARDS, dtype=jnp.int8),
+        'upcard': jnp.int8(-1),  # -1 = no upcard
+
+        # Game state
+        'current_player': jnp.int8(CHANCE_PLAYER),  # Start with chance node
+        'phase': jnp.int8(PHASE_DEAL),
+        'deal_cards_dealt': jnp.int8(0),  # 0-20 during deal, then 21 = done
+        'waiting_stock_draw': jnp.bool_(False),  # True after draw_stock action
+
+        # Tracking
+        'pass_count': jnp.int8(0),
+        'drawn_from_discard': jnp.int8(-1),
+        'num_draw_upcard': jnp.int32(0),
+        'prev_upcard': jnp.int8(-1),  # Upcard before current player's discard
+        'repeated_move': jnp.bool_(False),  # For repeated move termination
+
+        # Knock/layoff state
+        'knocked': jnp.zeros(2, dtype=jnp.bool_),
+        'knocker': jnp.int8(-1),
+        'layed_melds': jnp.zeros((2, NUM_MELDS), dtype=jnp.bool_),
+        'layoffs_mask': jnp.zeros(NUM_CARDS, dtype=jnp.bool_),
+        'finished_layoffs': jnp.bool_(False),
+        'deadwood': jnp.zeros(2, dtype=jnp.int32),
+        'knocker_deadwood': jnp.int32(-1),  # Knocker's deadwood when entering layoff (-1 = not set)
+
+        # Game outcome
+        'done': jnp.bool_(False),
+        'winner': jnp.int8(-1),
+        'p0_score': jnp.int32(0),
+        'p1_score': jnp.int32(0),
+    }
+
+
+@jax.jit
+def is_chance_node(state):
+    """Return True if current state is a chance node."""
+    in_deal = state['phase'] == PHASE_DEAL
+    waiting_stock = state['waiting_stock_draw']
+    return in_deal | waiting_stock
+
+
+@jax.jit
+def get_hand(state, player):
+    """Get hand mask for a player."""
+    return jnp.where(player == 0, state['player0_hand'], state['player1_hand'])
+
+
+# =============================================================================
+# Legal Actions - V2
+# =============================================================================
+
+@jax.jit
+def chance_outcomes_mask(state):
+    """Return mask of legal chance outcomes (cards still in deck)."""
+    return state['deck'] > 0
+
+
+@jax.jit
 def legal_actions_mask(state):
-    """Return mask of legal actions (vectorized, JIT-compatible)."""
+    """Return mask of legal actions."""
     phase = state['phase']
     player = state['current_player']
+
+    # Initialize mask
+    mask = jnp.zeros(NUM_ACTIONS, dtype=jnp.bool_)
+
+    # === Chance nodes: legal actions are cards in deck ===
+    is_chance = is_chance_node(state)
+    deck_cards = state['deck'] > 0
+    mask = jnp.where(is_chance, mask.at[:NUM_CARDS].set(deck_cards), mask)
+
+    # For non-chance nodes:
     hand = get_hand(state, player)
-
-    # Initialize action mask
-    # Actions 0-51: card actions (discard or layoff)
-    # 52: draw upcard, 53: draw stock, 54: pass, 55: knock
-    # 56+: meld actions
-
-    # Create masks for different action types
-    card_in_hand = (hand > 0)  # Shape: (52,)
-    valid_melds = valid_melds_mask(hand)  # Shape: (NUM_MELDS,)
+    card_in_hand = hand > 0
 
     # Calculate deadwood for knock eligibility
     deadwood = calculate_deadwood(hand)
-    hand_total = hand_total_points(hand)
+    valid_melds = valid_melds_mask(hand)
+
+    # Stock info
+    stock_count = jnp.sum(state['deck'])
+    is_wall = stock_count <= WALL_STOCK_SIZE
+    has_upcard = state['upcard'] >= 0
 
     # === Phase: FirstUpcard ===
-    first_upcard = (phase == PHASE_FIRST_UPCARD)
-    first_upcard_draw = first_upcard  # Can draw upcard
-    first_upcard_pass = first_upcard  # Can pass
+    first_upcard = (phase == PHASE_FIRST_UPCARD) & ~is_chance
+    mask = jnp.where(first_upcard & has_upcard, mask.at[ACTION_DRAW_UPCARD].set(True), mask)
+    mask = jnp.where(first_upcard, mask.at[ACTION_PASS].set(True), mask)
 
     # === Phase: Draw ===
-    draw_phase = (phase == PHASE_DRAW)
-    stock_count = jnp.sum(state['stock_mask'])
-    is_wall = stock_count <= 2
-    has_upcard = (state['upcard'] >= 0)
-    draw_upcard = draw_phase & ~is_wall & has_upcard
-    draw_stock = draw_phase & ~is_wall & (stock_count > 0)
-    draw_pass = draw_phase & is_wall  # Wall phase: only pass
+    draw_phase = (phase == PHASE_DRAW) & ~is_chance
+    can_draw_upcard = draw_phase & ~is_wall & has_upcard
+    can_draw_stock = draw_phase & ~is_wall & (stock_count > 0)
+    mask = jnp.where(can_draw_upcard, mask.at[ACTION_DRAW_UPCARD].set(True), mask)
+    mask = jnp.where(can_draw_stock, mask.at[ACTION_DRAW_STOCK].set(True), mask)
+
+    # === Phase: Wall ===
+    wall_phase = (phase == PHASE_WALL) & ~is_chance
+    # In wall phase, knock automatically includes the upcard, so check deadwood with upcard added
+    upcard_for_wall = state['upcard']
+    hand_with_upcard = jnp.where(upcard_for_wall >= 0, hand.at[upcard_for_wall].set(1), hand)
+    deadwood_with_upcard = min_deadwood_after_discard(hand_with_upcard)  # 11 cards, need to discard
+    can_knock_wall = wall_phase & (deadwood_with_upcard <= KNOCK_THRESHOLD)
+    mask = jnp.where(wall_phase, mask.at[ACTION_PASS].set(True), mask)
+    mask = jnp.where(can_knock_wall, mask.at[ACTION_KNOCK].set(True), mask)
 
     # === Phase: Discard ===
-    discard_phase = (phase == PHASE_DISCARD)
-    can_knock_discard = discard_phase & (deadwood <= KNOCK_THRESHOLD)
+    discard_phase = (phase == PHASE_DISCARD) & ~is_chance
+
+    # For knock eligibility with 11 cards, C++ calculates deadwood AFTER optimal discard
+    min_dw_after_discard = min_deadwood_after_discard(hand)
+    can_knock_discard = discard_phase & (min_dw_after_discard <= KNOCK_THRESHOLD)
+
+    # Can discard any card in hand (C++ has no restriction on drawing and discarding same card)
+    mask = jnp.where(discard_phase, mask.at[:NUM_CARDS].set(card_in_hand), mask)
+    mask = jnp.where(can_knock_discard, mask.at[ACTION_KNOCK].set(True), mask)
 
     # === Phase: Knock ===
-    knock_phase = (phase == PHASE_KNOCK)
+    knock_phase = (phase == PHASE_KNOCK) & ~is_chance
     hand_count = jnp.sum(hand)
     has_11_cards = hand_count == 11
 
-    # With 11 cards: can discard cards that keep deadwood <= threshold
-    # Simplified: allow discarding any card in hand (C++ does more complex check)
-    # The proper check would require calculating deadwood for each possible discard
-    knock_11_cards = knock_phase & has_11_cards
+    # With 11 cards: can only discard cards that keep deadwood <= KNOCK_THRESHOLD
+    # For each card, check if removing it gives valid knock deadwood
+    # Optimized: compute deadwood for all discards at once (computes valid_melds ONCE)
+    all_deadwoods = calculate_deadwood_all_discards(hand)
+    knock_discard_mask = (hand > 0) & (all_deadwoods <= KNOCK_THRESHOLD)
+    mask = jnp.where(knock_phase & has_11_cards, mask.at[:NUM_CARDS].set(knock_discard_mask), mask)
 
-    # With 10 cards or fewer: can lay melds or pass
-    # Note: C++ restricts melds/discards to valid arrangements, but we simplify
-    # by allowing any valid meld and always allowing pass (to prevent getting stuck)
-    knock_10_cards = knock_phase & (hand_count <= 10)
-    # Always allow pass in knock phase with <= 10 cards to prevent getting stuck
-    can_pass_knock = knock_10_cards
+    # With 10 or fewer cards: can lay valid melds
+    # Rule: can pass once remaining hand's total points <= KNOCK_THRESHOLD (10)
+    # (Cards are removed from hand when melds are laid, remaining cards are all deadwood)
+    knock_10 = knock_phase & (hand_count <= 10)
+    meld_mask = knock_10 & valid_melds
+    # Calculate raw point total of remaining cards (no meld optimization - these ARE the deadwood)
+    remaining_points = hand_total_points(hand)
+    can_pass_knock = remaining_points <= KNOCK_THRESHOLD
+    # Allow pass if remaining points are low enough
+    mask = jnp.where(knock_10 & can_pass_knock, mask.at[ACTION_PASS].set(True), mask)
+    mask = jnp.where(knock_10, mask.at[ACTION_MELD_BASE:ACTION_MELD_BASE + NUM_MELDS].set(meld_mask), mask)
 
     # === Phase: Layoff ===
-    layoff_phase = (phase == PHASE_LAYOFF)
-    finished_layoffs = state['finished_layoffs']
+    layoff_phase = (phase == PHASE_LAYOFF) & ~is_chance
+    finished = state['finished_layoffs']
     knocker = state['knocker']
-    # Use where to safely index even when knocker is -1
     safe_knocker = jnp.where(knocker >= 0, knocker, 0)
     knocker_melds = state['layed_melds'][safe_knocker]
-    knocker_valid = knocker >= 0
 
-    # Compute layoff cards
+    # If knocker has gin (0 deadwood), opponent can't lay off - skip to meld phase
+    # Use the scalar knocker_deadwood field set when entering layoff phase
+    knocker_deadwood = state['knocker_deadwood']
+    is_gin = knocker_deadwood == 0
+    finished = finished | is_gin  # Treat gin as if layoffs are finished
+
     layoff_possible = compute_layoff_cards(knocker_melds, state['layoffs_mask'])
-    layoff_card_actions = layoff_phase & ~finished_layoffs & knocker_valid  # Can do layoff cards
 
-    # After layoffs: can lay own melds
-    layoff_meld_actions = layoff_phase & finished_layoffs
+    # Before finishing layoffs: can lay off cards or pass
+    pre_finish = layoff_phase & ~finished
+    layoff_card_mask = card_in_hand & layoff_possible
+    mask = jnp.where(pre_finish, mask.at[:NUM_CARDS].set(layoff_card_mask), mask)
+    mask = jnp.where(pre_finish, mask.at[ACTION_PASS].set(True), mask)
 
-    # === Build the mask ===
-    mask = jnp.zeros(NUM_ACTIONS, dtype=jnp.bool_)
-
-    # Card actions (0-51)
-    # Discard in discard phase OR knock phase with 11 cards OR layoff phase
-    card_mask = (
-        (discard_phase & card_in_hand) |
-        (knock_11_cards & card_in_hand) |
-        (layoff_card_actions & card_in_hand & layoff_possible)
-    )
-    mask = mask.at[:NUM_CARDS].set(card_mask)
-
-    # Special actions (52-55)
-    mask = mask.at[ACTION_DRAW_UPCARD].set(first_upcard_draw | draw_upcard)
-    mask = mask.at[ACTION_DRAW_STOCK].set(draw_stock)
-    mask = mask.at[ACTION_PASS].set(first_upcard_pass | draw_pass | can_pass_knock | layoff_phase)
-    mask = mask.at[ACTION_KNOCK].set(can_knock_discard)
-
-    # Meld actions (56+)
-    meld_mask = (knock_10_cards | layoff_meld_actions) & valid_melds
-    mask = mask.at[ACTION_MELD_BASE:ACTION_MELD_BASE + NUM_MELDS].set(meld_mask)
+    # After finishing layoffs: can lay own melds or pass
+    post_finish = layoff_phase & finished
+    mask = jnp.where(post_finish, mask.at[ACTION_PASS].set(True), mask)
+    meld_mask_layoff = post_finish & valid_melds
+    mask = jnp.where(post_finish, mask.at[ACTION_MELD_BASE:ACTION_MELD_BASE + NUM_MELDS].set(meld_mask_layoff), mask)
 
     return mask
 
 
 # =============================================================================
-# State Transitions
+# State Transitions - V2
 # =============================================================================
 
 @jax.jit
@@ -502,327 +710,354 @@ def step(state, action):
     """Apply action and return new state."""
     phase = state['phase']
     player = state['current_player']
+    is_chance = is_chance_node(state)
 
-    # Get initial hands
-    p0_hand = state['player0_hand']
-    p1_hand = state['player1_hand']
-    hand = jnp.where(player == 0, p0_hand, p1_hand)
+    # Copy all state fields
+    new_state = {k: v for k, v in state.items()}
 
-    # Initialize all state fields
-    new_p0_hand = p0_hand
-    new_p1_hand = p1_hand
-    new_stock_mask = state['stock_mask']
-    new_discard_mask = state['discard_mask']
-    new_upcard = state['upcard']
-    new_stock_top_idx = state['stock_top_idx']
-    new_current_player = state['current_player']
-    new_phase = state['phase']
-    new_done = state['done']
-    new_winner = state['winner']
-    new_pass_count = state['pass_count']
-    new_drawn_from_discard = state['drawn_from_discard']
-    new_repeated_move = state['repeated_move']
+    # === Handle chance nodes ===
 
-    # Initialize knock/layoff state fields
-    new_knocked = state['knocked']
-    new_knocker = state['knocker']
-    new_layed_melds = state['layed_melds']
-    new_layoffs_mask = state['layoffs_mask']
-    new_finished_layoffs = state['finished_layoffs']
-    new_deadwood = state['deadwood']
-    new_p0_score = state['p0_score']
-    new_p1_score = state['p1_score']
+    # Deal phase: action is which card to deal
+    in_deal = (phase == PHASE_DEAL) & is_chance
+    deal_count = state['deal_cards_dealt']
 
-    # Handle FirstUpcard phase
-    is_first_upcard = (phase == PHASE_FIRST_UPCARD)
+    # First 10 cards go to player 0
+    to_p0 = in_deal & (deal_count < 10)
+    new_p0_hand = jnp.where(to_p0, state['player0_hand'].at[action].set(1), state['player0_hand'])
 
-    # Action: Pass in first upcard
-    is_pass_first = is_first_upcard & (action == ACTION_PASS)
-    new_pass_count = jnp.where(is_pass_first, new_pass_count + 1, new_pass_count)
-    both_passed = (new_pass_count >= 2)
-    new_phase = jnp.where(is_pass_first & both_passed, jnp.int8(PHASE_DRAW), new_phase)
-    new_current_player = jnp.where(is_pass_first & both_passed, jnp.int8(0), new_current_player)
-    new_current_player = jnp.where(is_pass_first & ~both_passed, jnp.int8(1 - player), new_current_player)
-    # When both pass on first upcard, that upcard can no longer be drawn
-    new_upcard = jnp.where(is_pass_first & both_passed, jnp.int8(-1), new_upcard)
+    # Next 10 cards go to player 1
+    to_p1 = in_deal & (deal_count >= 10) & (deal_count < 20)
+    new_p1_hand = jnp.where(to_p1, state['player1_hand'].at[action].set(1), state['player1_hand'])
 
-    # Action: Draw upcard in first upcard
-    is_draw_up_first = is_first_upcard & (action == ACTION_DRAW_UPCARD)
-    upcard = state['upcard']
-    updated_hand = hand.at[upcard].set(1)
-    new_p0_hand = jnp.where(is_draw_up_first & (player == 0), updated_hand, new_p0_hand)
-    new_p1_hand = jnp.where(is_draw_up_first & (player == 1), updated_hand, new_p1_hand)
-    new_upcard = jnp.where(is_draw_up_first, jnp.int8(-1), new_upcard)
-    new_phase = jnp.where(is_draw_up_first, jnp.int8(PHASE_DISCARD), new_phase)
-    # Track that we drew this card from discard (can't discard it back)
-    new_drawn_from_discard = jnp.where(is_draw_up_first, jnp.int8(upcard), new_drawn_from_discard)
+    # Card 21 is upcard
+    to_upcard = in_deal & (deal_count == 20)
+    new_upcard = jnp.where(to_upcard, jnp.int8(action), state['upcard'])
 
-    # Handle Draw phase
-    is_draw_phase = (phase == PHASE_DRAW)
+    # Remove card from deck
+    new_deck = jnp.where(in_deal, state['deck'].at[action].set(0), state['deck'])
 
-    # Action: Draw from stock
-    is_draw_stock = is_draw_phase & (action == ACTION_DRAW_STOCK)
-    stock_idx = state['stock_top_idx']
-    drawn_card_stock = state['stock_order'][stock_idx]
-    updated_hand_stock = hand.at[drawn_card_stock].set(1)
-    new_p0_hand = jnp.where(is_draw_stock & (player == 0), updated_hand_stock, new_p0_hand)
-    new_p1_hand = jnp.where(is_draw_stock & (player == 1), updated_hand_stock, new_p1_hand)
-    new_stock_mask = jnp.where(is_draw_stock, new_stock_mask.at[drawn_card_stock].set(0), new_stock_mask)
-    new_stock_top_idx = jnp.where(is_draw_stock, stock_idx + 1, new_stock_top_idx)
-    new_phase = jnp.where(is_draw_stock, jnp.int8(PHASE_DISCARD), new_phase)
-    # Drawing from stock - can discard any card
-    new_drawn_from_discard = jnp.where(is_draw_stock, jnp.int8(-1), new_drawn_from_discard)
+    # Update deal count
+    new_deal_count = jnp.where(in_deal, deal_count + 1, deal_count)
 
-    # Action: Draw upcard (in draw phase)
-    is_draw_up = is_draw_phase & (action == ACTION_DRAW_UPCARD)
-    upcard_draw = state['upcard']
-    updated_hand_up = hand.at[upcard_draw].set(1)
-    new_p0_hand = jnp.where(is_draw_up & (player == 0), updated_hand_up, new_p0_hand)
-    new_p1_hand = jnp.where(is_draw_up & (player == 1), updated_hand_up, new_p1_hand)
-    new_upcard = jnp.where(is_draw_up, jnp.int8(-1), new_upcard)
-    new_phase = jnp.where(is_draw_up, jnp.int8(PHASE_DISCARD), new_phase)
-    # Track that we drew this card from discard (can't discard it back)
-    new_drawn_from_discard = jnp.where(is_draw_up, jnp.int8(upcard_draw), new_drawn_from_discard)
+    # Check if dealing is complete (21 cards dealt)
+    deal_complete = in_deal & (new_deal_count >= 21)
+    new_phase = jnp.where(deal_complete, jnp.int8(PHASE_FIRST_UPCARD), phase)
+    new_player = jnp.where(deal_complete, jnp.int8(0), player)
+    # Set prev_upcard to the dealt upcard when deal completes
+    new_prev_upcard = jnp.where(deal_complete, jnp.int8(action), state['prev_upcard'])
 
-    # Action: Pass in draw phase (Wall) - ends game in draw
-    is_pass_wall = is_draw_phase & (action == ACTION_PASS)
-    new_phase = jnp.where(is_pass_wall, jnp.int8(PHASE_GAME_OVER), new_phase)
-    new_done = jnp.where(is_pass_wall, True, new_done)
-    new_winner = jnp.where(is_pass_wall, jnp.int8(2), new_winner)  # 2 = draw
+    # Keep as chance player during deal
+    new_player = jnp.where(in_deal & ~deal_complete, jnp.int8(CHANCE_PLAYER), new_player)
 
-    # Handle Discard phase - need to use updated hands
-    current_p0 = jnp.where(is_draw_up_first & (player == 0), updated_hand,
-                          jnp.where(is_draw_stock & (player == 0), updated_hand_stock,
-                                   jnp.where(is_draw_up & (player == 0), updated_hand_up, new_p0_hand)))
-    current_p1 = jnp.where(is_draw_up_first & (player == 1), updated_hand,
-                          jnp.where(is_draw_stock & (player == 1), updated_hand_stock,
-                                   jnp.where(is_draw_up & (player == 1), updated_hand_up, new_p1_hand)))
+    # Stock draw chance node: action is which card player gets
+    stock_draw = state['waiting_stock_draw'] & is_chance
+    hand = get_hand(state, player)
+    drawn_hand = hand.at[action].set(1)
+    new_p0_hand = jnp.where(stock_draw & (player == 0), drawn_hand, new_p0_hand)
+    new_p1_hand = jnp.where(stock_draw & (player == 1), drawn_hand, new_p1_hand)
+    new_deck = jnp.where(stock_draw, new_deck.at[action].set(0), new_deck)
+    new_waiting = jnp.where(stock_draw, False, state['waiting_stock_draw'])
+    new_phase = jnp.where(stock_draw, jnp.int8(PHASE_DISCARD), new_phase)
+    # After stock draw, drawn_from_discard = -1 (can discard anything)
+    new_drawn_from_discard = jnp.where(stock_draw, jnp.int8(-1), state['drawn_from_discard'])
 
-    is_discard = (new_phase == PHASE_DISCARD) & (action < NUM_CARDS)
-    current_hand_for_discard = jnp.where(player == 0, current_p0, current_p1)
-    discarded_hand = current_hand_for_discard.at[action].set(0)
+    # Update state with chance node changes
+    new_state['player0_hand'] = new_p0_hand
+    new_state['player1_hand'] = new_p1_hand
+    new_state['deck'] = new_deck
+    new_state['upcard'] = new_upcard
+    new_state['deal_cards_dealt'] = new_deal_count
+    new_state['waiting_stock_draw'] = new_waiting
+    new_state['phase'] = new_phase
+    new_state['current_player'] = new_player
+    new_state['drawn_from_discard'] = new_drawn_from_discard
+    new_state['prev_upcard'] = new_prev_upcard
 
-    new_p0_hand = jnp.where(is_discard & (player == 0), discarded_hand, current_p0)
-    new_p1_hand = jnp.where(is_discard & (player == 1), discarded_hand, current_p1)
-    new_discard_mask = jnp.where(is_discard, new_discard_mask.at[action].set(1), new_discard_mask)
-    new_upcard = jnp.where(is_discard, jnp.int8(action), new_upcard)
+    # === Handle regular (non-chance) actions ===
+    not_chance = ~is_chance
 
-    # Check for repeated move: discarding the same card just drawn from discard
-    # C++ logic: if upcard == prev_upcard (discarded same card drawn from discard):
-    #   - if repeated_move was already true: game ends as draw
-    #   - else: set repeated_move = true
-    # Otherwise: repeated_move = false
-    this_is_repeat = is_discard & (action == state['drawn_from_discard'])
-    both_repeated = this_is_repeat & state['repeated_move']  # Both players did it
+    # --- FirstUpcard phase ---
+    first_upcard = (phase == PHASE_FIRST_UPCARD) & not_chance
 
-    # Update repeated_move flag for next turn
-    new_repeated_move = jnp.where(is_discard & this_is_repeat, True, new_repeated_move)
-    new_repeated_move = jnp.where(is_discard & ~this_is_repeat, False, new_repeated_move)
+    # Pass in first upcard
+    pass_first = first_upcard & (action == ACTION_PASS)
+    new_pass_count = jnp.where(pass_first, state['pass_count'] + 1, state['pass_count'])
+    both_passed = new_pass_count >= 2
+    # After both pass, upcard goes to discard and player 0 draws
+    new_phase = jnp.where(pass_first & both_passed, jnp.int8(PHASE_DRAW), new_state['phase'])
+    new_player = jnp.where(pass_first & both_passed, jnp.int8(0), new_state['current_player'])
+    new_upcard_after_pass = jnp.where(pass_first & both_passed, jnp.int8(-1), new_state['upcard'])
+    # Add upcard to discard pile when both pass
+    upcard_val = state['upcard']
+    new_discard = jnp.where(
+        pass_first & both_passed & (upcard_val >= 0),
+        state['discard_pile'].at[upcard_val].set(1),
+        state['discard_pile']
+    )
+    # Switch player if only first pass
+    new_player = jnp.where(pass_first & ~both_passed, jnp.int8(1 - player), new_player)
 
-    # After discard, switch player and go to Draw phase (unless both repeated or stock empty)
-    stock_empty = ~jnp.any(new_stock_mask > 0)
-    # Both players repeated = game ends as draw
-    new_phase = jnp.where(is_discard & both_repeated, jnp.int8(PHASE_GAME_OVER), new_phase)
-    new_done = jnp.where(is_discard & both_repeated, True, new_done)
-    new_winner = jnp.where(is_discard & both_repeated, jnp.int8(2), new_winner)
-    # Stock empty also ends game
-    new_phase = jnp.where(is_discard & ~both_repeated & stock_empty, jnp.int8(PHASE_GAME_OVER), new_phase)
-    new_done = jnp.where(is_discard & ~both_repeated & stock_empty, True, new_done)
-    new_winner = jnp.where(is_discard & ~both_repeated & stock_empty, jnp.int8(2), new_winner)
-    # Normal case: continue to draw phase
-    new_phase = jnp.where(is_discard & ~both_repeated & ~stock_empty, jnp.int8(PHASE_DRAW), new_phase)
-    new_current_player = jnp.where(is_discard & ~both_repeated, jnp.int8(1 - player), new_current_player)
+    # Draw upcard in first upcard
+    draw_first = first_upcard & (action == ACTION_DRAW_UPCARD)
+    upcard_card = state['upcard']
+    hand = get_hand(state, player)
+    hand_with_upcard = hand.at[upcard_card].set(1)
+    new_p0_hand_draw = jnp.where(draw_first & (player == 0), hand_with_upcard, new_state['player0_hand'])
+    new_p1_hand_draw = jnp.where(draw_first & (player == 1), hand_with_upcard, new_state['player1_hand'])
+    new_upcard_draw = jnp.where(draw_first, jnp.int8(-1), new_upcard_after_pass)
+    new_phase_draw = jnp.where(draw_first, jnp.int8(PHASE_DISCARD), new_phase)
+    new_drawn_from_discard = jnp.where(draw_first, jnp.int8(upcard_card), new_state['drawn_from_discard'])
+    # Count upcard draws in first_upcard phase too
+    new_num_upcard_first = jnp.where(draw_first, state['num_draw_upcard'] + 1, state['num_draw_upcard'])
 
-    # Handle Knock action from Discard phase - enters KNOCK phase
-    is_knock = (state['phase'] == PHASE_DISCARD) & (action == ACTION_KNOCK)
-    # Set knocked flag and knocker
-    new_knocked = jnp.where(is_knock, new_knocked.at[player].set(True), new_knocked)
-    new_knocker = jnp.where(is_knock, jnp.int8(player), new_knocker)
-    # Update deadwood for both players (now tracking total card values)
-    new_deadwood = jnp.where(is_knock, jnp.array([
-        hand_total_points(new_p0_hand),
-        hand_total_points(new_p1_hand)
-    ], dtype=jnp.int32), new_deadwood)
-    new_phase = jnp.where(is_knock, jnp.int8(PHASE_KNOCK), new_phase)
+    new_state['pass_count'] = new_pass_count
+    new_state['phase'] = jnp.where(draw_first, new_phase_draw, new_phase)
+    new_state['current_player'] = new_player
+    new_state['upcard'] = jnp.where(draw_first, new_upcard_draw, new_upcard_after_pass)
+    new_state['discard_pile'] = new_discard
+    new_state['player0_hand'] = new_p0_hand_draw
+    new_state['player1_hand'] = new_p1_hand_draw
+    new_state['drawn_from_discard'] = new_drawn_from_discard
+    new_state['num_draw_upcard'] = new_num_upcard_first
 
-    # Handle KNOCK phase actions
-    is_knock_phase = (phase == PHASE_KNOCK)
+    # --- Draw phase ---
+    draw_phase = (phase == PHASE_DRAW) & not_chance
 
-    # In KNOCK phase with 11 cards: must discard first
-    has_11_cards = jnp.sum(hand) == 11
-    is_knock_discard = is_knock_phase & has_11_cards & (action < NUM_CARDS)
-    discarded_hand_knock = hand.at[action].set(0)
-    new_p0_hand = jnp.where(is_knock_discard & (player == 0), discarded_hand_knock, new_p0_hand)
-    new_p1_hand = jnp.where(is_knock_discard & (player == 1), discarded_hand_knock, new_p1_hand)
-    new_discard_mask = jnp.where(is_knock_discard, new_discard_mask.at[action].set(1), new_discard_mask)
-    # Update deadwood after discard
-    new_hand_after_knock_discard = jnp.where(player == 0, new_p0_hand, new_p1_hand)
-    knock_discard_deadwood = hand_total_points(new_hand_after_knock_discard)
-    new_deadwood = jnp.where(is_knock_discard, new_deadwood.at[player].set(knock_discard_deadwood), new_deadwood)
+    # Draw from stock -> becomes chance node
+    draw_stock = draw_phase & (action == ACTION_DRAW_STOCK)
+    new_state['waiting_stock_draw'] = jnp.where(draw_stock, True, new_state['waiting_stock_draw'])
+    # current_player stays the same, will be used in stock draw chance node
 
-    # In KNOCK phase with 10 cards: can lay melds or pass
-    is_meld_action = (action >= ACTION_MELD_BASE) & (action < ACTION_MELD_BASE + NUM_MELDS)
-    is_knock_meld = is_knock_phase & ~has_11_cards & is_meld_action
+    # Draw upcard in draw phase
+    draw_up = draw_phase & (action == ACTION_DRAW_UPCARD)
+    new_num_upcard = jnp.where(draw_up, new_state['num_draw_upcard'] + 1, new_state['num_draw_upcard'])
+    too_many = new_num_upcard >= MAX_NUM_DRAW_UPCARD_ACTIONS
+
+    # If too many upcard draws, game ends
+    new_state['done'] = jnp.where(draw_up & too_many, True, new_state['done'])
+    new_state['winner'] = jnp.where(draw_up & too_many, jnp.int8(2), new_state['winner'])
+    new_state['phase'] = jnp.where(draw_up & too_many, jnp.int8(PHASE_GAME_OVER), new_state['phase'])
+
+    # Otherwise draw the upcard
+    draw_up_ok = draw_up & ~too_many
+    upcard_d = state['upcard']
+    hand_d = get_hand(state, player)
+    hand_with_up = hand_d.at[upcard_d].set(1)
+    new_state['player0_hand'] = jnp.where(draw_up_ok & (player == 0), hand_with_up, new_state['player0_hand'])
+    new_state['player1_hand'] = jnp.where(draw_up_ok & (player == 1), hand_with_up, new_state['player1_hand'])
+    new_state['upcard'] = jnp.where(draw_up_ok, jnp.int8(-1), new_state['upcard'])
+    new_state['phase'] = jnp.where(draw_up_ok, jnp.int8(PHASE_DISCARD), new_state['phase'])
+    new_state['drawn_from_discard'] = jnp.where(draw_up_ok, jnp.int8(upcard_d), new_state['drawn_from_discard'])
+    new_state['num_draw_upcard'] = new_num_upcard
+
+    # --- Discard phase ---
+    discard_phase = (phase == PHASE_DISCARD) & not_chance
+    is_discard = discard_phase & (action < NUM_CARDS)
+    is_knock = discard_phase & (action == ACTION_KNOCK)
+
+    # Discard a card
+    hand_disc = get_hand(new_state, player)
+    hand_after_disc = hand_disc.at[action].set(0)
+    new_state['player0_hand'] = jnp.where(is_discard & (player == 0), hand_after_disc, new_state['player0_hand'])
+    new_state['player1_hand'] = jnp.where(is_discard & (player == 1), hand_after_disc, new_state['player1_hand'])
+    # Card becomes new upcard
+    new_state['upcard'] = jnp.where(is_discard, jnp.int8(action), new_state['upcard'])
+    # Old upcard goes to discard pile
+    old_upcard = state['upcard']
+    new_state['discard_pile'] = jnp.where(
+        is_discard & (old_upcard >= 0),
+        new_state['discard_pile'].at[old_upcard].set(1),
+        new_state['discard_pile']
+    )
+
+    # Check for repeated move termination (discarding same card as prev_upcard)
+    prev_up = state['prev_upcard']
+    is_repeated = is_discard & (action == prev_up)
+    was_repeated = state['repeated_move']
+    # If this is the second repeated move, game ends
+    repeated_game_end = is_repeated & was_repeated
+    new_state['done'] = jnp.where(repeated_game_end, True, new_state['done'])
+    new_state['winner'] = jnp.where(repeated_game_end, jnp.int8(2), new_state['winner'])  # Draw
+    new_state['phase'] = jnp.where(repeated_game_end, jnp.int8(PHASE_GAME_OVER), new_state['phase'])
+    # If this is the first repeated move, set flag
+    new_state['repeated_move'] = jnp.where(is_repeated & ~was_repeated, True, new_state['repeated_move'])
+    # Reset repeated_move if not a repeated move
+    new_state['repeated_move'] = jnp.where(is_discard & ~is_repeated, False, new_state['repeated_move'])
+
+    # Check stock for wall phase (only if game didn't end from repeated move)
+    stock_count = jnp.sum(new_state['deck'])
+    enter_wall = is_discard & (stock_count <= WALL_STOCK_SIZE) & ~repeated_game_end
+    new_state['phase'] = jnp.where(is_discard & enter_wall & ~repeated_game_end, jnp.int8(PHASE_WALL), new_state['phase'])
+    new_state['phase'] = jnp.where(is_discard & ~enter_wall & ~repeated_game_end, jnp.int8(PHASE_DRAW), new_state['phase'])
+    new_state['current_player'] = jnp.where(is_discard & ~repeated_game_end, jnp.int8(1 - player), new_state['current_player'])
+    new_state['drawn_from_discard'] = jnp.where(is_discard, jnp.int8(-1), new_state['drawn_from_discard'])
+    # Set prev_upcard for next player's turn (the card we just discarded is now the upcard)
+    new_state['prev_upcard'] = jnp.where(is_discard & ~repeated_game_end, jnp.int8(action), new_state['prev_upcard'])
+
+    # Knock action -> go to knock phase
+    new_state['phase'] = jnp.where(is_knock, jnp.int8(PHASE_KNOCK), new_state['phase'])
+    new_state['knocker'] = jnp.where(is_knock, player, new_state['knocker'])
+    new_state['knocked'] = jnp.where(is_knock, new_state['knocked'].at[player].set(True), new_state['knocked'])
+
+    # --- Wall phase ---
+    wall_phase = (phase == PHASE_WALL) & not_chance
+    wall_pass = wall_phase & (action == ACTION_PASS)
+    wall_knock = wall_phase & (action == ACTION_KNOCK)
+
+    # Pass in wall -> game ends immediately (single pass ends the game in wall phase)
+    new_state['done'] = jnp.where(wall_pass, True, new_state['done'])
+    new_state['winner'] = jnp.where(wall_pass, jnp.int8(2), new_state['winner'])  # Draw
+    new_state['phase'] = jnp.where(wall_pass, jnp.int8(PHASE_GAME_OVER), new_state['phase'])
+
+    # Knock in wall - automatically add upcard to hand first
+    wall_upcard = state['upcard']
+    hand_wall = get_hand(new_state, player)
+    hand_with_wall_up = hand_wall.at[wall_upcard].set(1)
+    new_state['player0_hand'] = jnp.where(wall_knock & (player == 0), hand_with_wall_up, new_state['player0_hand'])
+    new_state['player1_hand'] = jnp.where(wall_knock & (player == 1), hand_with_wall_up, new_state['player1_hand'])
+    new_state['upcard'] = jnp.where(wall_knock, jnp.int8(-1), new_state['upcard'])
+    new_state['phase'] = jnp.where(wall_knock, jnp.int8(PHASE_KNOCK), new_state['phase'])
+    new_state['knocker'] = jnp.where(wall_knock, player, new_state['knocker'])
+    new_state['knocked'] = jnp.where(wall_knock, new_state['knocked'].at[player].set(True), new_state['knocked'])
+
+    # NOTE: Knocker's deadwood is NOT computed at knock time.
+    # It's computed when entering layoff phase (see knock_pass handling below).
+    # At that point, the knocker has already discarded and laid their melds,
+    # so we can compute their actual remaining deadwood.
+
+    # --- Knock phase ---
+    knock_phase = (phase == PHASE_KNOCK) & not_chance
+    knock_discard = knock_phase & (action < NUM_CARDS)
+    knock_meld = knock_phase & (action >= ACTION_MELD_BASE) & (action < ACTION_MELD_BASE + NUM_MELDS)
+    knock_pass = knock_phase & (action == ACTION_PASS)
+
+    # Discard in knock (when have 11 cards)
+    hand_k = get_hand(new_state, player)
+    hand_after_k = hand_k.at[action].set(0)
+    new_state['player0_hand'] = jnp.where(knock_discard & (player == 0), hand_after_k, new_state['player0_hand'])
+    new_state['player1_hand'] = jnp.where(knock_discard & (player == 1), hand_after_k, new_state['player1_hand'])
+    # Discarded card becomes upcard
+    new_state['upcard'] = jnp.where(knock_discard, jnp.int8(action), new_state['upcard'])
+    old_up = new_state['upcard']
+    new_state['discard_pile'] = jnp.where(
+        knock_discard & (state['upcard'] >= 0),
+        new_state['discard_pile'].at[state['upcard']].set(1),
+        new_state['discard_pile']
+    )
+
+    # Lay meld in knock - mark meld as laid AND remove cards from hand
     meld_id = action - ACTION_MELD_BASE
-    meld_mask = MELD_MASKS[meld_id]
-    hand_after_meld = hand - meld_mask
-    new_p0_hand = jnp.where(is_knock_meld & (player == 0), hand_after_meld, new_p0_hand)
-    new_p1_hand = jnp.where(is_knock_meld & (player == 1), hand_after_meld, new_p1_hand)
-    # Track layed melds
-    new_layed_melds = jnp.where(is_knock_meld, new_layed_melds.at[player, meld_id].set(True), new_layed_melds)
-    # Update deadwood
-    knock_meld_deadwood = hand_total_points(hand_after_meld)
-    new_deadwood = jnp.where(is_knock_meld, new_deadwood.at[player].set(knock_meld_deadwood), new_deadwood)
+    safe_meld_id = jnp.clip(meld_id, 0, NUM_MELDS - 1)
+    new_state['layed_melds'] = jnp.where(
+        knock_meld,
+        new_state['layed_melds'].at[player, safe_meld_id].set(True),
+        new_state['layed_melds']
+    )
+    # Remove meld cards from hand
+    meld_cards = MELD_MASKS[safe_meld_id]
+    hand_after_meld_k = get_hand(new_state, player) - meld_cards
+    new_state['player0_hand'] = jnp.where(knock_meld & (player == 0), hand_after_meld_k, new_state['player0_hand'])
+    new_state['player1_hand'] = jnp.where(knock_meld & (player == 1), hand_after_meld_k, new_state['player1_hand'])
 
-    # In KNOCK phase: pass means done laying melds, go to LAYOFF
-    is_knock_pass = is_knock_phase & ~has_11_cards & (action == ACTION_PASS)
-    # Get current hand for deadwood calculation
-    current_hand_for_pass = jnp.where(player == 0, new_p0_hand, new_p1_hand)
-    final_knock_deadwood = hand_total_points(current_hand_for_pass)
-    new_deadwood = jnp.where(is_knock_pass, new_deadwood.at[player].set(final_knock_deadwood), new_deadwood)
-    # If knocker has gin (deadwood 0), opponent can't lay off cards
-    knocker_deadwood = new_deadwood[player]
-    new_finished_layoffs = jnp.where(is_knock_pass & (knocker_deadwood == 0), True, new_finished_layoffs)
-    # Switch to opponent and enter LAYOFF phase
-    new_current_player = jnp.where(is_knock_pass, jnp.int8(1 - player), new_current_player)
-    new_phase = jnp.where(is_knock_pass, jnp.int8(PHASE_LAYOFF), new_phase)
+    # Pass in knock -> go to layoff
+    # Compute knocker's final deadwood (after discarding and laying melds)
+    # The remaining cards ARE deadwood - just sum their values, don't look for melds
+    # (Any melds the knocker didn't lay are their choice, remaining cards are deadwood)
+    knocker_final_hand = get_hand(new_state, player)
+    knocker_final_dw = hand_total_points(knocker_final_hand)
+    # Store knocker's deadwood in a scalar field to avoid JAX JIT array issues
+    new_state['knocker_deadwood'] = jnp.where(knock_pass, knocker_final_dw, new_state['knocker_deadwood'])
 
-    # Handle LAYOFF phase actions
-    is_layoff_phase = (phase == PHASE_LAYOFF)
-    is_finished_layoffs = state['finished_layoffs']
+    new_state['phase'] = jnp.where(knock_pass, jnp.int8(PHASE_LAYOFF), new_state['phase'])
+    new_state['current_player'] = jnp.where(knock_pass, jnp.int8(1 - player), new_state['current_player'])
 
-    # Layoff a card (before finished_layoffs)
-    is_layoff_card = is_layoff_phase & ~is_finished_layoffs & (action < NUM_CARDS)
-    layoff_hand = hand.at[action].set(0)
-    new_p0_hand = jnp.where(is_layoff_card & (player == 0), layoff_hand, new_p0_hand)
-    new_p1_hand = jnp.where(is_layoff_card & (player == 1), layoff_hand, new_p1_hand)
-    new_layoffs_mask = jnp.where(is_layoff_card, new_layoffs_mask.at[action].set(True), new_layoffs_mask)
-    # Update deadwood
-    layoff_deadwood = hand_total_points(layoff_hand)
-    new_deadwood = jnp.where(is_layoff_card, new_deadwood.at[player].set(layoff_deadwood), new_deadwood)
+    # --- Layoff phase ---
+    layoff_phase = (phase == PHASE_LAYOFF) & not_chance
+    finished = state['finished_layoffs']
+    # If knocker has gin (0 deadwood), treat as finished (no layoffs allowed, skip to meld phase)
+    knocker_deadwood_l = state['knocker_deadwood']
+    is_gin_l = knocker_deadwood_l == 0
+    finished = finished | is_gin_l
+    layoff_card = layoff_phase & ~finished & (action < NUM_CARDS)
+    layoff_pass_pre = layoff_phase & ~finished & (action == ACTION_PASS)
+    layoff_meld = layoff_phase & finished & (action >= ACTION_MELD_BASE) & (action < ACTION_MELD_BASE + NUM_MELDS)
+    layoff_pass_post = layoff_phase & finished & (action == ACTION_PASS)
 
-    # Pass to finish laying off cards
-    is_layoff_pass_cards = is_layoff_phase & ~is_finished_layoffs & (action == ACTION_PASS)
-    new_finished_layoffs = jnp.where(is_layoff_pass_cards, True, new_finished_layoffs)
+    # Lay off card onto knocker's melds
+    hand_l = get_hand(new_state, player)
+    hand_after_l = hand_l.at[action].set(0)
+    new_state['player0_hand'] = jnp.where(layoff_card & (player == 0), hand_after_l, new_state['player0_hand'])
+    new_state['player1_hand'] = jnp.where(layoff_card & (player == 1), hand_after_l, new_state['player1_hand'])
+    new_state['layoffs_mask'] = jnp.where(layoff_card, new_state['layoffs_mask'].at[action].set(True), new_state['layoffs_mask'])
 
-    # Lay meld (after finished_layoffs)
-    is_layoff_meld = is_layoff_phase & is_finished_layoffs & is_meld_action
-    layoff_meld_mask = MELD_MASKS[meld_id]
-    hand_after_layoff_meld = hand - layoff_meld_mask
-    new_p0_hand = jnp.where(is_layoff_meld & (player == 0), hand_after_layoff_meld, new_p0_hand)
-    new_p1_hand = jnp.where(is_layoff_meld & (player == 1), hand_after_layoff_meld, new_p1_hand)
-    new_layed_melds = jnp.where(is_layoff_meld, new_layed_melds.at[player, meld_id].set(True), new_layed_melds)
-    # Update deadwood
-    layoff_meld_deadwood = hand_total_points(hand_after_layoff_meld)
-    new_deadwood = jnp.where(is_layoff_meld, new_deadwood.at[player].set(layoff_meld_deadwood), new_deadwood)
+    # Pass before finishing -> done with layoffs
+    new_state['finished_layoffs'] = jnp.where(layoff_pass_pre, True, new_state['finished_layoffs'])
 
-    # Pass to end game (after finished_layoffs)
-    is_layoff_pass_end = is_layoff_phase & is_finished_layoffs & (action == ACTION_PASS)
-    # Finalize deadwood
-    final_layoff_hand = jnp.where(player == 0, new_p0_hand, new_p1_hand)
-    new_deadwood = jnp.where(is_layoff_pass_end, new_deadwood.at[player].set(hand_total_points(final_layoff_hand)), new_deadwood)
-    new_phase = jnp.where(is_layoff_pass_end, jnp.int8(PHASE_GAME_OVER), new_phase)
-    new_done = jnp.where(is_layoff_pass_end, True, new_done)
+    # Lay own meld - mark meld as laid AND remove cards from hand
+    meld_id_l = action - ACTION_MELD_BASE
+    safe_meld_id_l = jnp.clip(meld_id_l, 0, NUM_MELDS - 1)
+    new_state['layed_melds'] = jnp.where(
+        layoff_meld,
+        new_state['layed_melds'].at[player, safe_meld_id_l].set(True),
+        new_state['layed_melds']
+    )
+    # Remove meld cards from hand
+    meld_cards_l = MELD_MASKS[safe_meld_id_l]
+    hand_after_meld_l = get_hand(new_state, player) - meld_cards_l
+    new_state['player0_hand'] = jnp.where(layoff_meld & (player == 0), hand_after_meld_l, new_state['player0_hand'])
+    new_state['player1_hand'] = jnp.where(layoff_meld & (player == 1), hand_after_meld_l, new_state['player1_hand'])
 
-    return {
-        'player0_hand': new_p0_hand,
-        'player1_hand': new_p1_hand,
-        'stock_mask': new_stock_mask,
-        'discard_mask': new_discard_mask,
-        'upcard': new_upcard,
-        'stock_top_idx': new_stock_top_idx,
-        'stock_order': state['stock_order'],
-        'current_player': new_current_player,
-        'phase': new_phase,
-        'done': new_done,
-        'winner': new_winner,
-        'p0_score': new_p0_score,
-        'p1_score': new_p1_score,
-        'drawn_from_discard': new_drawn_from_discard,
-        'repeated_move': new_repeated_move,
-        'pass_count': new_pass_count,
-        # Knock/layoff state
-        'knocked': new_knocked,
-        'knocker': new_knocker,
-        'layed_melds': new_layed_melds,
-        'layoffs_mask': new_layoffs_mask,
-        'finished_layoffs': new_finished_layoffs,
-        'deadwood': new_deadwood,
-    }
+    # Pass after finishing -> calculate scores and end game
+    knocker_p = new_state['knocker']
+    opponent = 1 - knocker_p
+    knocker_hand = jnp.where(knocker_p == 0, new_state['player0_hand'], new_state['player1_hand'])
+    opponent_hand = jnp.where(opponent == 0, new_state['player0_hand'], new_state['player1_hand'])
 
+    knocker_dw = calculate_deadwood(knocker_hand)
+    opponent_dw = calculate_deadwood(opponent_hand)
 
-# Scoring constants (matching C++ defaults)
-GIN_BONUS = 25
-UNDERCUT_BONUS = 25
+    is_gin = knocker_dw == 0
+    is_undercut = opponent_dw <= knocker_dw
+
+    # Scoring
+    gin_score = opponent_dw + GIN_BONUS
+    undercut_score = knocker_dw - opponent_dw + UNDERCUT_BONUS
+    normal_score = knocker_dw - opponent_dw
+
+    knocker_wins = ~is_gin & ~is_undercut
+    opponent_wins = is_undercut & ~is_gin
+
+    final_score = jnp.where(is_gin, gin_score,
+                  jnp.where(is_undercut, -undercut_score, -normal_score))
+
+    p0_score = jnp.where(knocker_p == 0, final_score, -final_score)
+
+    new_state['deadwood'] = jnp.where(layoff_pass_post,
+        new_state['deadwood'].at[knocker_p].set(knocker_dw).at[opponent].set(opponent_dw),
+        new_state['deadwood'])
+    new_state['p0_score'] = jnp.where(layoff_pass_post, p0_score, new_state['p0_score'])
+    new_state['p1_score'] = jnp.where(layoff_pass_post, -p0_score, new_state['p1_score'])
+    new_state['done'] = jnp.where(layoff_pass_post, True, new_state['done'])
+    winner = jnp.where(p0_score > 0, 0, jnp.where(p0_score < 0, 1, 2))
+    new_state['winner'] = jnp.where(layoff_pass_post, jnp.int8(winner), new_state['winner'])
+    new_state['phase'] = jnp.where(layoff_pass_post, jnp.int8(PHASE_GAME_OVER), new_state['phase'])
+
+    return new_state
 
 
 @jax.jit
 def get_returns(state):
-    """Get returns for both players.
-
-    Scoring:
-    - If player knocked: score = opponent_deadwood - knocker_deadwood
-    - If knocker has gin (deadwood=0): add gin_bonus
-    - If score < 0 (undercut): subtract undercut_bonus
-    - If neither knocked: both get 0 (draw)
-    """
-    knocked = state['knocked']
-    deadwood = state['deadwood']
-
-    # Initialize returns to 0
-    p0_return = jnp.float32(0.0)
-    p1_return = jnp.float32(0.0)
-
-    # Player 0 knocked
-    p0_knocked = knocked[0]
-    p0_score = jnp.float32(deadwood[1] - deadwood[0])
-    # Gin bonus
-    p0_score = jnp.where(deadwood[0] == 0, p0_score + GIN_BONUS, p0_score)
-    # Undercut bonus (subtracted if score < 0)
-    p0_score = jnp.where(p0_score < 0, p0_score - UNDERCUT_BONUS, p0_score)
-
-    p0_return = jnp.where(p0_knocked, p0_score, p0_return)
-    p1_return = jnp.where(p0_knocked, -p0_score, p1_return)
-
-    # Player 1 knocked
-    p1_knocked = knocked[1]
-    p1_score = jnp.float32(deadwood[0] - deadwood[1])
-    # Gin bonus
-    p1_score = jnp.where(deadwood[1] == 0, p1_score + GIN_BONUS, p1_score)
-    # Undercut bonus
-    p1_score = jnp.where(p1_score < 0, p1_score - UNDERCUT_BONUS, p1_score)
-
-    p0_return = jnp.where(p1_knocked, -p1_score, p0_return)
-    p1_return = jnp.where(p1_knocked, p1_score, p1_return)
-
-    # If neither knocked (draw), both get 0 (already initialized)
-
-    return jnp.array([p0_return, p1_return])
+    """Get returns for both players."""
+    return jnp.array([state['p0_score'], state['p1_score']], dtype=jnp.float32)
 
 
 # =============================================================================
-# Batched operations
-# =============================================================================
-
-batched_init = jax.vmap(init_state)
-batched_step = jax.vmap(step)
-batched_legal_actions_mask = jax.vmap(legal_actions_mask)
-batched_get_returns = jax.vmap(get_returns)
-
-
-def init_batch(batch_size, rng_key):
-    """Initialize a batch of games."""
-    keys = jax.random.split(rng_key, batch_size)
-    return batched_init(keys)
-
-
-# =============================================================================
-# OpenSpiel Python Game Interface
+# OpenSpiel Wrapper
 # =============================================================================
 
 _GAME_TYPE = pyspiel.GameType(
     short_name="python_gin_rummy_jax",
-    long_name="Python Gin Rummy (JAX)",
+    long_name="Python Gin Rummy JAX",
     dynamics=pyspiel.GameType.Dynamics.SEQUENTIAL,
     chance_mode=pyspiel.GameType.ChanceMode.EXPLICIT_STOCHASTIC,
     information=pyspiel.GameType.Information.IMPERFECT_INFORMATION,
@@ -840,22 +1075,20 @@ _GAME_INFO = pyspiel.GameInfo(
     num_distinct_actions=NUM_ACTIONS,
     max_chance_outcomes=NUM_CARDS,
     num_players=2,
-    min_utility=-1.0,
-    max_utility=1.0,
+    min_utility=-100.0,
+    max_utility=100.0,
     utility_sum=0.0,
     max_game_length=300,
 )
 
 
-class GinRummyJaxState(pyspiel.State):
+class GinRummyJaxStateV2(pyspiel.State):
     """OpenSpiel state wrapper around JAX state."""
 
-    def __init__(self, game, jax_state=None, rng_key=None):
+    def __init__(self, game, jax_state=None):
         super().__init__(game)
         if jax_state is None:
-            if rng_key is None:
-                rng_key = jax.random.PRNGKey(np.random.randint(0, 2**31))
-            self._jax_state = init_state(rng_key)
+            self._jax_state = init_state()
         else:
             self._jax_state = jax_state
         self._cached_legal_actions = None
@@ -863,21 +1096,34 @@ class GinRummyJaxState(pyspiel.State):
     def current_player(self):
         if self._jax_state['done']:
             return pyspiel.PlayerId.TERMINAL
+        if is_chance_node(self._jax_state):
+            return pyspiel.PlayerId.CHANCE
         return int(self._jax_state['current_player'])
 
     def is_chance_node(self):
-        # We handle chance internally via RNG, so no explicit chance nodes
-        return False
+        return bool(is_chance_node(self._jax_state)) and not self._jax_state['done']
+
+    def chance_outcomes(self):
+        """Return list of (action, probability) pairs for chance node."""
+        mask = chance_outcomes_mask(self._jax_state)
+        mask_np = np.asarray(mask)
+        legal_cards = np.where(mask_np)[0]
+        n = len(legal_cards)
+        if n == 0:
+            return []
+        prob = 1.0 / n
+        return [(int(card), prob) for card in legal_cards]
 
     def legal_actions(self, player=None):
         if self._cached_legal_actions is None:
             mask = legal_actions_mask(self._jax_state)
-            self._cached_legal_actions = [i for i in range(NUM_ACTIONS) if mask[i]]
+            mask_np = np.asarray(mask)
+            self._cached_legal_actions = list(np.where(mask_np)[0])
         return self._cached_legal_actions
 
     def legal_actions_mask(self, player=None):
         mask = legal_actions_mask(self._jax_state)
-        return [int(m) for m in mask]
+        return list(np.asarray(mask, dtype=np.int32))
 
     def _apply_action(self, action):
         self._jax_state = step(self._jax_state, action)
@@ -893,25 +1139,6 @@ class GinRummyJaxState(pyspiel.State):
     def player_return(self, player):
         return self.returns()[player]
 
-    def observation_tensor(self, player=None):
-        if player is None:
-            player = self.current_player()
-        if player < 0:
-            player = 0
-
-        # Build observation: current player's hand + visible info
-        hand = get_hand(self._jax_state, player)
-        discard = self._jax_state['discard_mask']
-        upcard_one_hot = jnp.zeros(NUM_CARDS)
-        if self._jax_state['upcard'] >= 0:
-            upcard_one_hot = upcard_one_hot.at[self._jax_state['upcard']].set(1)
-
-        obs = jnp.concatenate([hand, discard, upcard_one_hot])
-        return list(obs.astype(float))
-
-    def observation_string(self, player=None):
-        return str(self)
-
     def __str__(self):
         p0_hand = self._jax_state['player0_hand']
         p1_hand = self._jax_state['player1_hand']
@@ -919,7 +1146,7 @@ class GinRummyJaxState(pyspiel.State):
         phase = int(self._jax_state['phase'])
         player = int(self._jax_state['current_player'])
 
-        phase_names = ['Deal', 'FirstUpcard', 'Draw', 'Discard', 'Knock', 'Layoff', 'GameOver']
+        phase_names = ['Deal', 'FirstUpcard', 'Draw', 'Discard', 'Knock', 'Layoff', 'Wall', 'GameOver']
 
         def cards_str(mask):
             cards = [i for i in range(NUM_CARDS) if mask[i]]
@@ -930,107 +1157,62 @@ class GinRummyJaxState(pyspiel.State):
                 return 'XX'
             ranks = 'A23456789TJQK'
             suits = 'scdh'
-            return ranks[c // 4] + suits[c % 4]
+            # C++ encoding: card = suit * 13 + rank
+            suit = c // 13
+            rank = c % 13
+            return ranks[rank] + suits[suit]
 
         lines = [
             f"Phase: {phase_names[phase]}, Player: {player}",
             f"Upcard: {card_name(upcard)}",
             f"P0 hand: {cards_str(p0_hand)}",
             f"P1 hand: {cards_str(p1_hand)}",
+            f"Deck size: {int(jnp.sum(self._jax_state['deck']))}",
         ]
         return '\n'.join(lines)
 
     def clone(self):
-        cloned = GinRummyJaxState(self.get_game())
+        cloned = GinRummyJaxStateV2(self.get_game())
         cloned._jax_state = jax.tree.map(lambda x: x.copy(), self._jax_state)
         return cloned
 
 
-class GinRummyJaxGame(pyspiel.Game):
-    """OpenSpiel game wrapper for JAX Gin Rummy."""
+class GinRummyJaxGameV2(pyspiel.Game):
+    """OpenSpiel game wrapper."""
 
     def __init__(self, params=None):
         super().__init__(_GAME_TYPE, _GAME_INFO, params or {})
 
     def new_initial_state(self):
-        return GinRummyJaxState(self)
+        return GinRummyJaxStateV2(self)
 
-    def num_distinct_actions(self):
-        return NUM_ACTIONS
-
-    def num_players(self):
-        return 2
-
-    def min_utility(self):
-        return -1.0
-
-    def max_utility(self):
-        return 1.0
-
-    def observation_tensor_shape(self):
-        return [NUM_CARDS * 3]  # hand + discard + upcard
-
-    def observation_tensor_size(self):
-        return NUM_CARDS * 3
-
-    def max_game_length(self):
-        return 300
+    def make_py_observer(self, iig_obs_type=None, params=None):
+        return None
 
 
 # Register the game
-pyspiel.register_game(_GAME_TYPE, GinRummyJaxGame)
+pyspiel.register_game(_GAME_TYPE, GinRummyJaxGameV2)
 
-
-# =============================================================================
-# Testing
-# =============================================================================
 
 if __name__ == "__main__":
-    print("=== Testing JAX Gin Rummy ===\n")
-
-    # Test single game
-    print("1. Testing OpenSpiel interface:")
+    # Quick test
     game = pyspiel.load_game("python_gin_rummy_jax")
     state = game.new_initial_state()
-    print(f"Initial state:\n{state}\n")
+
+    print("Initial state (before deal):")
+    print(state)
+    print(f"Is chance: {state.is_chance_node()}")
+    print(f"Chance outcomes: {len(state.chance_outcomes())} cards")
+
+    # Deal all 21 cards
+    import random
+    random.seed(42)
+    while state.is_chance_node():
+        outcomes = state.chance_outcomes()
+        action, _ = random.choice(outcomes)
+        state.apply_action(action)
+
+    print("\nAfter dealing:")
+    print(state)
     print(f"Current player: {state.current_player()}")
     print(f"Legal actions: {state.legal_actions()}")
-    print(f"Is terminal: {state.is_terminal()}")
-
-    # Play a few moves
-    print("\n2. Playing a few moves:")
-    for i in range(10):
-        if state.is_terminal():
-            break
-        legal = state.legal_actions()
-        action = legal[0]
-        print(f"  Player {state.current_player()}: action {action}")
-        state.apply_action(action)
-
-    print(f"\nState after moves:\n{state}")
-
-    # Play a complete game
-    print("\n3. Playing complete game:")
-    state = game.new_initial_state()
-    move_count = 0
-    while not state.is_terminal() and move_count < 200:
-        legal = state.legal_actions()
-        action = np.random.choice(legal)
-        state.apply_action(action)
-        move_count += 1
-
-    print(f"Game ended after {move_count} moves")
-    print(f"Returns: {state.returns()}")
-
-    # Test batched operations
-    print("\n4. Testing batched operations:")
-    key = jax.random.PRNGKey(42)
-    batch_size = 100
-    states = init_batch(batch_size, key)
-    print(f"Initialized {batch_size} games")
-
-    # Check shapes
-    print(f"  player0_hand shape: {states['player0_hand'].shape}")
-    print(f"  phase shape: {states['phase'].shape}")
-
-    print("\n=== Done ===")

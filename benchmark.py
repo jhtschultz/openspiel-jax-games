@@ -1,169 +1,125 @@
-"""Benchmark JAX Connect Four vs Original OpenSpiel."""
-
+"""Benchmark JAX Gin Rummy vs C++ OpenSpiel."""
+import os
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
 import time
-import numpy as np
 import jax
 import jax.numpy as jnp
-import pyspiel
+import numpy as np
 
-# Import to register JAX game
-import connect_four_jax
-from connect_four_jax import (
-    init_batch, batched_step, batched_legal_actions_mask,
-    init_state, step, legal_actions_mask
-)
+# For standalone GPU benchmarks
+import gin_rummy_core as gin
 
+def benchmark_standalone(batch_size=10000, n_steps=200, n_batches=5, fast=True):
+    """Benchmark standalone JAX implementation (no pyspiel)."""
+    print(f"\n=== Standalone Benchmark (batch={batch_size}, fast={fast}) ===")
+    print(f"Device: {jax.devices()[0]}")
 
-def benchmark_original_sequential(num_games=1000):
-    """Benchmark original OpenSpiel connect_four sequentially."""
-    game = pyspiel.load_game("connect_four")
-    rng = np.random.RandomState(42)
-
-    start = time.perf_counter()
-    for _ in range(num_games):
-        state = game.new_initial_state()
-        while not state.is_terminal():
-            legal = state.legal_actions()
-            action = rng.choice(legal)
-            state.apply_action(action)
-    elapsed = time.perf_counter() - start
-
-    return num_games / elapsed
-
-
-def benchmark_jax_openspiel_sequential(num_games=1000):
-    """Benchmark JAX game through OpenSpiel interface sequentially."""
-    game = pyspiel.load_game("python_connect_four_jax")
-    rng = np.random.RandomState(42)
-
-    start = time.perf_counter()
-    for _ in range(num_games):
-        state = game.new_initial_state()
-        while not state.is_terminal():
-            legal = state.legal_actions()
-            action = rng.choice(legal)
-            state.apply_action(action)
-    elapsed = time.perf_counter() - start
-
-    return num_games / elapsed
-
-
-def benchmark_jax_batched(batch_size=1024, num_batches=100):
-    """Benchmark JAX batched simulation on GPU."""
-
-    # JIT compile a full game step that handles the batch
-    @jax.jit
-    def play_one_step(states, key):
-        masks = batched_legal_actions_mask(states)
-        # Sample random valid actions
-        # For each game, pick a random column that's legal
-        num_legal = masks.sum(axis=1)
-        rand_idx = jax.random.randint(key, (batch_size,), 0, 7)
-        # Use cumsum trick to get nth legal action
-        cumsum = jnp.cumsum(masks, axis=1)
-        action_idx = rand_idx % jnp.maximum(num_legal, 1)
-        actions = jnp.argmax(cumsum > action_idx[:, None], axis=1)
-        # Only apply if game not done
-        new_states = batched_step(states, actions)
-        return new_states
-
-    # Warmup
-    print(f"  Warming up JIT compilation...")
-    key = jax.random.PRNGKey(42)
-    states = init_batch(batch_size)
-    for i in range(42):
-        key, subkey = jax.random.split(key)
-        states = play_one_step(states, subkey)
-    # Force completion
-    jax.block_until_ready(states['board'])
-
-    # Benchmark
-    print(f"  Running benchmark...")
-    key = jax.random.PRNGKey(123)
-    total_games = 0
-    start = time.perf_counter()
-
-    for batch_idx in range(num_batches):
-        states = init_batch(batch_size)
-        for step_idx in range(42):  # Max game length
-            key, subkey = jax.random.split(key)
-            states = play_one_step(states, subkey)
-        jax.block_until_ready(states['board'])
-        total_games += batch_size
-
-    elapsed = time.perf_counter() - start
-    return total_games / elapsed
-
-
-def benchmark_jax_pure_batched(batch_size=4096, num_batches=100):
-    """Benchmark pure JAX batched simulation (no OpenSpiel wrapper)."""
+    mask_fn = gin.legal_actions_mask_fast if fast else gin.legal_actions_mask
 
     @jax.jit
-    def play_full_game(key):
-        """Play a full batch of games to completion."""
-        states = init_batch(batch_size)
+    def run_batch(key):
+        keys = jax.random.split(key, batch_size)
+        states = jax.vmap(lambda _: gin.init_state())(keys)
 
-        def step_fn(carry, _):
-            states, key = carry
-            key, subkey = jax.random.split(key)
-            masks = batched_legal_actions_mask(states)
-            num_legal = masks.sum(axis=1)
-            rand_idx = jax.random.randint(subkey, (batch_size,), 0, 7)
-            cumsum = jnp.cumsum(masks, axis=1)
-            action_idx = rand_idx % jnp.maximum(num_legal, 1)
-            actions = jnp.argmax(cumsum > action_idx[:, None], axis=1)
-            new_states = batched_step(states, actions)
-            return (new_states, key), None
+        def step_fn(i, carry):
+            states, keys = carry
+            def single(state, key):
+                mask = mask_fn(state)
+                key, sk = jax.random.split(key)
+                p = mask.astype(jnp.float32) / (mask.sum() + 1e-8)
+                a = jax.random.choice(sk, jnp.arange(gin.NUM_ACTIONS), p=p)
+                ns = jax.lax.cond(state['done'], lambda: state, lambda: gin.step(state, a))
+                return ns, key
+            return jax.vmap(single)(states, keys)
 
-        (final_states, _), _ = jax.lax.scan(step_fn, (states, key), None, length=42)
-        return final_states
+        final_states, _ = jax.lax.fori_loop(0, n_steps, step_fn, (states, keys))
+        return final_states['done']
 
-    # Warmup
-    print(f"  Warming up JIT compilation (scan version)...")
-    key = jax.random.PRNGKey(42)
-    result = play_full_game(key)
-    jax.block_until_ready(result['board'])
+    print("Compiling...")
+    done = run_batch(jax.random.PRNGKey(0))
+    jax.block_until_ready(done)
+    print("Compiled!")
 
-    # Benchmark
-    print(f"  Running benchmark...")
-    total_games = 0
-    start = time.perf_counter()
+    start = time.time()
+    for i in range(n_batches):
+        done = run_batch(jax.random.PRNGKey(i))
+    jax.block_until_ready(done)
+    elapsed = time.time() - start
 
-    for batch_idx in range(num_batches):
-        key = jax.random.PRNGKey(batch_idx)
-        result = play_full_game(key)
-        jax.block_until_ready(result['board'])
-        total_games += batch_size
+    total = n_batches * batch_size
+    rate = total / elapsed
+    print(f"{total:,} games in {elapsed:.2f}s = {rate:,.0f} games/sec")
+    print(f"Speedup vs C++ (118 g/s): {rate/118:.1f}x")
+    return rate
 
-    elapsed = time.perf_counter() - start
-    return total_games / elapsed
+
+def verify_vs_cpp(n_games=50):
+    """Verify JAX implementation matches C++ OpenSpiel."""
+    print(f"\n=== Correctness Check vs C++ ({n_games} games) ===")
+
+    try:
+        import pyspiel
+    except ImportError:
+        print("pyspiel not available, skipping correctness check")
+        return
+
+    cpp_game = pyspiel.load_game("gin_rummy")
+    jax_game = pyspiel.load_game("python_gin_rummy_jax")
+
+    disagreements = 0
+    for game_idx in range(n_games):
+        rng = np.random.RandomState(game_idx)
+        cpp_state = cpp_game.new_initial_state()
+        jax_state = jax_game.new_initial_state()
+
+        for _ in range(300):
+            if cpp_state.is_terminal() != jax_state.is_terminal():
+                disagreements += 1
+                break
+            if cpp_state.is_terminal():
+                break
+
+            if cpp_state.is_chance_node() != jax_state.is_chance_node():
+                disagreements += 1
+                break
+
+            if cpp_state.is_chance_node():
+                outcomes = [o[0] for o in cpp_state.chance_outcomes()]
+                action = rng.choice(outcomes)
+            else:
+                cpp_legal = set(a for a in cpp_state.legal_actions() if a <= 55)
+                jax_legal = set(a for a in jax_state.legal_actions() if a <= 55)
+                if cpp_legal != jax_legal:
+                    disagreements += 1
+                    break
+                action = rng.choice(list(cpp_legal))
+
+            cpp_state.apply_action(action)
+            jax_state.apply_action(action)
+
+    print(f"{n_games} games, {disagreements} disagreements")
+    if disagreements == 0:
+        print("PASSED!")
+    return disagreements
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Connect Four Benchmark")
-    print(f"JAX devices: {jax.devices()}")
-    print("=" * 60)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch", type=int, default=10000)
+    parser.add_argument("--fast", action="store_true", default=True)
+    parser.add_argument("--full", action="store_true", help="Use full legal_actions_mask")
+    parser.add_argument("--verify", action="store_true", help="Run C++ verification")
+    parser.add_argument("--all", action="store_true", help="Run all benchmarks")
+    args = parser.parse_args()
 
-    print("\n1. Original OpenSpiel (C++, sequential):")
-    gps = benchmark_original_sequential(num_games=2000)
-    print(f"   {gps:,.0f} games/sec")
-
-    print("\n2. JAX OpenSpiel wrapper (sequential):")
-    gps = benchmark_jax_openspiel_sequential(num_games=500)
-    print(f"   {gps:,.0f} games/sec")
-
-    print("\n3. JAX batched (batch=1024, Python loop):")
-    gps = benchmark_jax_batched(batch_size=1024, num_batches=50)
-    print(f"   {gps:,.0f} games/sec")
-
-    print("\n4. JAX batched (batch=4096, jax.lax.scan):")
-    gps = benchmark_jax_pure_batched(batch_size=4096, num_batches=50)
-    print(f"   {gps:,.0f} games/sec")
-
-    print("\n5. JAX batched (batch=16384, jax.lax.scan):")
-    gps = benchmark_jax_pure_batched(batch_size=16384, num_batches=20)
-    print(f"   {gps:,.0f} games/sec")
-
-    print("\n" + "=" * 60)
-    print("Done!")
+    if args.all:
+        benchmark_standalone(batch_size=10000, fast=True)
+        benchmark_standalone(batch_size=10000, fast=False)
+        benchmark_standalone(batch_size=100000, fast=True)
+        verify_vs_cpp()
+    else:
+        fast = not args.full
+        benchmark_standalone(batch_size=args.batch, fast=fast)
+        if args.verify:
+            verify_vs_cpp()
