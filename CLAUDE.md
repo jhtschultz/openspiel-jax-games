@@ -94,9 +94,10 @@ Uses precomputed 8192-entry LUT for run scoring, with full scenario enumeration:
 | Version | Games/sec | vs C++ |
 |---------|-----------|--------|
 | C++ SimpleGinRummyBot | 153 | 1x |
-| JAX simple_bot_action (batch=10000) | **24,026** | **157x** |
+| JAX simple_bot_action (batch=10000) | 24,026 | 157x |
+| **JAX simple_bot_action_opt (batch=20000)** | **60,646** | **396x** |
 
-Simple bot uses **exact 216-scenario algorithm** - verified 100% correct against C++ (54,336 checks, 0 disagreements).
+Simple bot uses **exact 216-scenario algorithm** - verified 100% correct against C++ (54,336 checks, 0 disagreements). Optimized version uses loop compression (11 vs 52 iterations) and O(1) meld check via LUT.
 
 ## Performance History
 
@@ -116,6 +117,7 @@ Track each optimization attempt here. Always benchmark on A100 GPU with `python 
 | 2025-12-28 | LUT + 36 combos + int16 (batch=18000) | 37,242 | 1.23x (exact) |
 | 2025-12-28 | Delta Lookups v3 (224 lookups, batch=20000) | 152,211 | 4.1x (but incorrect!) |
 | 2025-12-28 | **Exact 216-scenario** (3 sets + 4-split, batch=10000) | **24,026** | **157x vs C++, 100% correct** |
+| 2025-12-28 | **Squeezed Juice** (11 vs 52 loop, O(1) meld check, batch=20000) | **60,646** | **2.5x vs previous, 396x vs C++** |
 
 ### Optimization Ideas to Try
 - [x] LUT-based exact deadwood (implemented)
@@ -123,7 +125,7 @@ Track each optimization attempt here. Always benchmark on A100 GPU with `python 
 - [x] Use int16/int8 for memory bandwidth
 - [x] Delta Lookups v3 (fast but incorrect for edge cases)
 - [x] **Exact 216-scenario**: handles 3 sets + 4-card splitting, 100% correct!
-- [ ] Further memory optimization to increase batch size
+- [x] **Squeezed Juice**: loop compression (11 vs 52), O(1) meld check via RUN_MEMBER_LUT
 - [ ] Profile with JAX profiler to identify remaining hotspots
 
 ## GCP Setup

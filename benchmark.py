@@ -53,9 +53,11 @@ def benchmark_standalone(batch_size=10000, n_steps=200, n_batches=5, fast=True):
     return rate
 
 
-def benchmark_simple_bot(batch_size=10000, n_steps=200, n_batches=5):
+def benchmark_simple_bot(batch_size=10000, n_steps=200, n_batches=5, use_opt=True):
     """Benchmark simple bot self-play."""
-    print(f"\n=== Simple Bot Benchmark (batch={batch_size}) ===")
+    bot_fn = gin.simple_bot_action_opt if use_opt else gin.simple_bot_action
+    label = "opt" if use_opt else "base"
+    print(f"\n=== Simple Bot Benchmark ({label}, batch={batch_size}) ===")
     print(f"Device: {jax.devices()[0]}")
 
     @jax.jit
@@ -66,7 +68,7 @@ def benchmark_simple_bot(batch_size=10000, n_steps=200, n_batches=5):
         def step_fn(i, carry):
             states, keys = carry
             def single(state, key):
-                a = gin.simple_bot_action(state)
+                a = bot_fn(state)
                 ns = jax.lax.cond(state['done'], lambda: state, lambda: gin.step(state, a))
                 return ns, key
             return jax.vmap(single)(states, keys)

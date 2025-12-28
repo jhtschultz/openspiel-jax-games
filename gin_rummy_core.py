@@ -382,6 +382,42 @@ def _build_subset_table():
 
 SUBSET_TABLE = _build_subset_table()  # (16, 6)
 
+def _build_run_member_table():
+    """Build (8192,) table: which ranks are part of a run for each suit config.
+
+    Value is a 13-bit mask indicating which ranks participate in runs.
+    """
+    import numpy as np
+    lut = []
+    for bits in range(8192):
+        held = [(bits >> i) & 1 for i in range(13)]
+        is_member = [0] * 13
+
+        # Check for runs of 3+
+        for i in range(11):  # Start positions 0..10
+            if held[i] and held[i+1] and held[i+2]:
+                is_member[i] = 1
+                is_member[i+1] = 1
+                is_member[i+2] = 1
+                # Extend for lengths 4, 5, ...
+                k = 3
+                while i + k < 13 and held[i + k]:
+                    is_member[i + k] = 1
+                    k += 1
+
+        mask = 0
+        for i, m in enumerate(is_member):
+            if m:
+                mask |= (1 << i)
+        lut.append(mask)
+
+    return jnp.array(lut, dtype=jnp.int16)
+
+RUN_MEMBER_LUT = _build_run_member_table()  # (8192,)
+
+# Int8 version of RUN_SCORE_LUT for memory bandwidth
+RUN_SCORE_LUT_8 = RUN_SCORE_LUT.astype(jnp.int8)
+
 # Precompute the 216 scenario indices
 _idx6 = jnp.arange(6)
 _grid_A, _grid_B, _grid_C = jnp.meshgrid(_idx6, _idx6, _idx6, indexing='ij')
@@ -584,6 +620,171 @@ def calculate_deadwood_all_discards_v3(hand):
 
 # Alias for backwards compatibility - use exact 216-scenario version
 calculate_deadwood_all_discards = calculate_deadwood_all_discards_exact
+
+# =============================================================================
+# Compressed deadwood solver (5x faster - only processes held cards)
+# =============================================================================
+
+@jax.jit
+def calculate_deadwood_compressed(hand):
+    """Calculate deadwood ONLY for cards actually in hand (11 vs 52 iterations).
+
+    Returns:
+        held_indices: (11,) int32 - indices of cards in hand (padded with 0)
+        deadwoods: (11,) int16 - deadwood if that card is discarded
+    """
+    # 1. Compress: Find indices of held cards (max 11 in Gin)
+    held_indices = jnp.argsort(~(hand > 0))[:11]  # Non-zero first
+    held_mask = jnp.take(hand, held_indices) > 0  # (11,) bool
+
+    # 2. Setup (same as exact version)
+    hand_4x13 = hand_to_4x13(hand)
+    rank_nibbles = jnp.dot(SUIT_POWERS, hand_4x13.astype(jnp.int32))
+    rank_counts = NIBBLE_POPCOUNTS[rank_nibbles]
+
+    is_candidate = rank_counts >= 3
+    set_indices = jnp.argsort(~is_candidate)[:3]
+    set_nibbles = rank_nibbles[set_indices]
+
+    options = SUBSET_TABLE[set_nibbles]
+    mask_A = options[0, SCENARIO_IDX_A]
+    mask_B = options[1, SCENARIO_IDX_B]
+    mask_C = options[2, SCENARIO_IDX_C]
+
+    pts_A = NIBBLE_POPCOUNTS[mask_A].astype(jnp.int16) * RANK_VALUES_16[set_indices[0]]
+    pts_B = NIBBLE_POPCOUNTS[mask_B].astype(jnp.int16) * RANK_VALUES_16[set_indices[1]]
+    pts_C = NIBBLE_POPCOUNTS[mask_C].astype(jnp.int16) * RANK_VALUES_16[set_indices[2]]
+    scenario_set_pts = pts_A + pts_B + pts_C
+
+    def _get_rem(mask, r_idx):
+        bits = jnp.stack([((mask >> i) & 1) for i in range(4)], axis=-1).astype(jnp.int16)
+        return bits * (jnp.int16(1) << r_idx)
+
+    total_removal = (_get_rem(mask_A, set_indices[0]) |
+                     _get_rem(mask_B, set_indices[1]) |
+                     _get_rem(mask_C, set_indices[2]))
+
+    base_suits = jnp.dot(hand_4x13.astype(jnp.int16), POWERS_OF_2_16)
+    scenario_suits = base_suits[None, :] & (~total_removal)
+    base_run_scores = RUN_SCORE_LUT_8[scenario_suits].astype(jnp.int16)
+    base_run_total = jnp.sum(base_run_scores, axis=1)
+    base_total = scenario_set_pts + base_run_total
+
+    total_hand_value = jnp.sum(hand_4x13.astype(jnp.int16) * RANK_VALUES_16[None, :])
+
+    # 3. Process only the 11 held cards (not 52!)
+    def process_held_discard(discard_idx):
+        d_suit = discard_idx // 13
+        d_rank = discard_idx % 13
+
+        fail_A = (d_rank == set_indices[0]) & ((mask_A >> d_suit) & 1).astype(jnp.bool_)
+        fail_B = (d_rank == set_indices[1]) & ((mask_B >> d_suit) & 1).astype(jnp.bool_)
+        fail_C = (d_rank == set_indices[2]) & ((mask_C >> d_suit) & 1).astype(jnp.bool_)
+        is_invalid = fail_A | fail_B | fail_C
+
+        new_suit_bits = scenario_suits[:, d_suit] & (~(jnp.int16(1) << d_rank))
+        new_run_score = RUN_SCORE_LUT_8[new_suit_bits].astype(jnp.int16)
+        old_run_score = base_run_scores[:, d_suit]
+
+        final_meld_pts = base_total - old_run_score + new_run_score
+        valid_meld_pts = jnp.where(is_invalid, jnp.int16(-1), final_meld_pts)
+        max_meld_pts = jnp.max(valid_meld_pts)
+
+        new_hand_value = total_hand_value - RANK_VALUES_16[d_rank]
+        return new_hand_value - max_meld_pts
+
+    deadwoods = jax.vmap(process_held_discard)(held_indices)
+    deadwoods = jnp.where(held_mask, deadwoods, jnp.int16(999))
+
+    return held_indices, deadwoods
+
+
+@jax.jit
+def card_would_be_in_meld_fast(hand, card):
+    """O(1) check if adding card creates/joins a meld using LUT."""
+    rank = card % 13
+    suit = card // 13
+
+    # 1. Set check: Do we have >= 2 of this rank already?
+    rank_count = hand[rank] + hand[rank + 13] + hand[rank + 26] + hand[rank + 39]
+    is_set = rank_count >= 2
+
+    # 2. Run check: Use RUN_MEMBER_LUT
+    suit_start = suit * 13
+    suit_cards = jax.lax.dynamic_slice(hand, (suit_start,), (13,))
+    suit_mask = jnp.dot(suit_cards.astype(jnp.int16), POWERS_OF_2_16)
+    new_mask = suit_mask | (jnp.int16(1) << rank)
+    run_members = RUN_MEMBER_LUT[new_mask]
+    is_run = ((run_members >> rank) & 1).astype(jnp.bool_)
+
+    return is_set | is_run
+
+
+@jax.jit
+def simple_bot_action_opt(state):
+    """Optimized simple bot using compressed deadwood solver."""
+    phase = state['phase']
+    player = state['current_player']
+    hand = get_hand(state, player)
+    upcard = state['upcard']
+    deck = state['deck']
+
+    # 1. Compressed deadwood for current hand
+    hand_indices, hand_dws = calculate_deadwood_compressed(hand)
+    min_dw_hand = jnp.min(hand_dws)
+
+    # Find best discard (minimize deadwood, break ties by highest value)
+    cand_values = CARD_VALUES[hand_indices]
+    is_optimal = (hand_dws == min_dw_hand) & (hand_dws < 999)
+    discard_score = jnp.where(is_optimal, cand_values.astype(jnp.int16) + 1000, jnp.int16(-1))
+    best_idx_local = jnp.argmax(discard_score)
+    best_discard_card = hand_indices[best_idx_local]
+
+    # 2. Compressed deadwood with upcard (for draw decisions)
+    hand_with_upcard = jnp.where(upcard >= 0, hand.at[upcard].set(1), hand)
+    _, up_dws = calculate_deadwood_compressed(hand_with_upcard)
+    min_dw_with_upcard = jnp.min(up_dws)
+
+    # === DECISION LOGIC ===
+
+    # Draw phase evaluation
+    upcard_enables_knock = min_dw_with_upcard <= KNOCK_THRESHOLD
+    upcard_in_meld = jnp.where(upcard >= 0, card_would_be_in_meld_fast(hand, upcard), False)
+    take_upcard = upcard_enables_knock | upcard_in_meld
+
+    # Chance action
+    is_chance = (phase == PHASE_DEAL) | state['waiting_stock_draw']
+    chance_action = jnp.argmax(deck)
+
+    # First upcard action
+    first_upcard_action = jnp.where(take_upcard, ACTION_DRAW_UPCARD, ACTION_PASS)
+
+    # Draw action
+    is_wall = jnp.sum(deck) <= WALL_STOCK_SIZE
+    draw_action = jnp.where(take_upcard & (upcard >= 0), ACTION_DRAW_UPCARD, ACTION_DRAW_STOCK)
+    draw_action = jnp.where(is_wall & ~take_upcard, ACTION_PASS, draw_action)
+
+    # Discard action
+    can_knock = min_dw_hand <= KNOCK_THRESHOLD
+    discard_action = jnp.where(can_knock, ACTION_KNOCK, best_discard_card)
+
+    # Knock action
+    hand_size = jnp.sum(hand)
+    knock_action = jnp.where(hand_size >= 11, best_discard_card, ACTION_PASS)
+
+    # Wall action
+    wall_can_knock = min_dw_with_upcard <= KNOCK_THRESHOLD
+    wall_action = jnp.where(wall_can_knock & (upcard >= 0), ACTION_KNOCK, ACTION_PASS)
+
+    # Multiplexer
+    action = jnp.where(is_chance, chance_action, jnp.int32(0))
+    action = jnp.where(phase == PHASE_FIRST_UPCARD, first_upcard_action, action)
+    action = jnp.where(phase == PHASE_DRAW, draw_action, action)
+    action = jnp.where(phase == PHASE_DISCARD, discard_action, action)
+    action = jnp.where(phase == PHASE_KNOCK, knock_action, action)
+    action = jnp.where(phase == PHASE_WALL, wall_action, action)
+
+    return action.astype(jnp.int32)
 
 # =============================================================================
 # Meld encoding
