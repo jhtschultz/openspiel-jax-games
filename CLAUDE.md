@@ -14,10 +14,11 @@ Current bottleneck: `calculate_deadwood` is called multiple times per turn (once
 
 ## Files
 
-- `gin_rummy_core.py` - Standalone JAX Gin Rummy (no pyspiel). Use for GPU benchmarks.
-- `gin_rummy_jax.py` - Gin Rummy with pyspiel wrapper. Matches C++ OpenSpiel exactly.
+- `gin_rummy_jax.py` - **Unified implementation** with LUT optimizations, full game logic (knock/layoff/scoring), and pyspiel wrapper. 44k games/sec (290x vs C++).
+- `gin_rummy_core.py` - Standalone JAX Gin Rummy (no pyspiel, simplified step function). 60k games/sec (396x vs C++).
 - `connect_four_jax.py` - JAX Connect Four implementation.
-- `benchmark.py` - Benchmark script with C++ verification (`--verify` flag).
+- `benchmark.py` - Benchmark script for gin_rummy_core.py
+- `benchmark_jax.py` - Benchmark script for merged gin_rummy_jax.py
 
 ## Usage
 
@@ -118,6 +119,7 @@ Track each optimization attempt here. Always benchmark on A100 GPU with `python 
 | 2025-12-28 | Delta Lookups v3 (224 lookups, batch=20000) | 152,211 | 4.1x (but incorrect!) |
 | 2025-12-28 | **Exact 216-scenario** (3 sets + 4-split, batch=10000) | **24,026** | **157x vs C++, 100% correct** |
 | 2025-12-28 | **Squeezed Juice** (11 vs 52 loop, O(1) meld check, batch=20000) | **60,646** | **2.5x vs previous, 396x vs C++** |
+| 2025-12-28 | **Merged gin_rummy_jax.py** (full game logic + LUT optimizations) | **44,357** | **290x vs C++, games complete with scoring** |
 
 ### Optimization Ideas to Try
 - [x] LUT-based exact deadwood (implemented)
