@@ -130,6 +130,36 @@ Track each optimization attempt here. Always benchmark on A100 GPU with `python 
 - [x] **Squeezed Juice**: loop compression (11 vs 52), O(1) meld check via RUN_MEMBER_LUT
 - [ ] Profile with JAX profiler to identify remaining hotspots
 
+## PPO Training Results (A100 GPU)
+
+Training a PPO agent against the simple bot using `ppo_gin_rummy_v2.py`.
+
+**Architecture:**
+- CNN for card patterns: (1,3) kernel for runs, (3,1) kernel for sets
+- Separate actor/critic heads after shared backbone
+- 167-dim observation: 52 hand + 52 discard pile + 52 known cards + 11 other features
+- Agent only plays strategic phases (FIRST_UPCARD, DRAW, DISCARD); optimal bot handles KNOCK/LAYOFF/WALL
+
+**1-Hour Training Run:**
+```
+Config: num_envs=4096, num_steps=128, ~25k FPS
+Final:  89.1M steps, 26.6% win rate, -0.140 avg return (normalized)
+```
+
+| Steps | Win Rate | Avg Return | Notes |
+|-------|----------|------------|-------|
+| 0.5M | 0.4% | -0.505 | Random baseline |
+| 5M | 3.0% | -0.410 | Early learning |
+| 25M | 19.5% | -0.209 | Rapid improvement |
+| 50M | 24.0% | -0.163 | Diminishing returns |
+| 89M | **26.6%** | **-0.140** | Final (1 hour) |
+
+**Observations:**
+- Strong early learning: 0.4% → 20% in first 25M steps
+- Diminishing returns after ~50M steps
+- Agent learns to beat optimal-strategy bot 26.6% of the time
+- Still improving slowly at cutoff, not fully plateaued
+
 ## GCP Setup
 
 ```bash
