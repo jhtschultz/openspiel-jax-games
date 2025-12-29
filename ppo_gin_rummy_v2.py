@@ -17,6 +17,9 @@ from functools import partial
 from typing import NamedTuple
 import time
 
+# Use bfloat16 for faster computation on A100
+DTYPE = jnp.bfloat16
+
 # Use gin_rummy_jax for training (has discard_pile, full game logic)
 import gin_rummy_jax as gin
 
@@ -27,6 +30,9 @@ NUM_ACTIONS = 241
 
 # Observation mode: "standard" (167 dims) or "alphazero" (728 dims, 14 planes)
 OBS_MODE = "standard"  # Toggle this for experiments
+
+# Oracle mode: if True, agent sees opponent's actual hand instead of known cards
+ORACLE_MODE = False  # Set via --oracle flag
 
 if OBS_MODE == "alphazero":
     # AlphaZero-style observation: 14 planes of 4x13
@@ -109,28 +115,40 @@ def update_known_cards(state, action, known_cards):
 # Environment Wrapper
 # =============================================================================
 
-def _make_observation_standard(game_state, known_cards, agent_player):
-    """Standard observation: 167 dims."""
+def _make_observation_standard(game_state, known_cards, agent_player, oracle=False):
+    """Standard observation: 167 dims.
+
+    If oracle=True, uses opponent's actual hand instead of known cards.
+    """
     hand = jnp.where(
         agent_player == 0,
         game_state['player0_hand'],
         game_state['player1_hand'])
     discard_pile = game_state['discard_pile']
+
+    # Oracle mode: see opponent's actual hand; otherwise just known cards
     opponent = 1 - agent_player
-    opp_known = known_cards[opponent]
+    if oracle:
+        opp_info = jnp.where(
+            agent_player == 0,
+            game_state['player1_hand'],
+            game_state['player0_hand'])
+    else:
+        opp_info = known_cards[opponent]
+
     phase_onehot = jax.nn.one_hot(game_state['phase'], 8)
     upcard_norm = (game_state['upcard'] + 1) / 53.0
     deck_count = jnp.sum(game_state['deck']) / 52.0
     deadwood = gin.calculate_deadwood_lut(hand) / 100.0
 
     return jnp.concatenate([
-        hand.astype(jnp.float32),         # 52
-        discard_pile.astype(jnp.float32), # 52
-        opp_known.astype(jnp.float32),    # 52
-        phase_onehot,                     # 8
-        jnp.array([upcard_norm]),         # 1
-        jnp.array([deck_count]),          # 1
-        jnp.array([deadwood]),            # 1
+        hand.astype(DTYPE),               # 52
+        discard_pile.astype(DTYPE),       # 52
+        opp_info.astype(DTYPE),           # 52: opponent's hand (oracle) or known cards
+        phase_onehot.astype(DTYPE),       # 8
+        jnp.array([upcard_norm], dtype=DTYPE),   # 1
+        jnp.array([deck_count], dtype=DTYPE),    # 1
+        jnp.array([deadwood], dtype=DTYPE),      # 1
     ])  # 167
 
 
@@ -149,16 +167,16 @@ def _make_observation_alphazero(game_state, known_cards, agent_player):
     deadwood = gin.calculate_deadwood_lut(hand) / 100.0
 
     # Reshape card vectors to 4x13 planes
-    hand_plane = hand.reshape(4, 13).astype(jnp.float32)
-    discard_plane = discard_pile.reshape(4, 13).astype(jnp.float32)
-    opp_known_plane = opp_known.reshape(4, 13).astype(jnp.float32)
+    hand_plane = hand.reshape(4, 13).astype(DTYPE)
+    discard_plane = discard_pile.reshape(4, 13).astype(DTYPE)
+    opp_known_plane = opp_known.reshape(4, 13).astype(DTYPE)
 
     # Phase: 8 one-hot planes
-    phase_planes = jnp.zeros((8, 4, 13), dtype=jnp.float32)
+    phase_planes = jnp.zeros((8, 4, 13), dtype=DTYPE)
     phase_planes = phase_planes.at[phase].set(1.0)
 
     # Upcard: one-hot plane
-    upcard_plane = jnp.zeros((4, 13), dtype=jnp.float32)
+    upcard_plane = jnp.zeros((4, 13), dtype=DTYPE)
     upcard_valid = upcard >= 0
     upcard_suit = upcard // 13
     upcard_rank = upcard % 13
@@ -169,8 +187,8 @@ def _make_observation_alphazero(game_state, known_cards, agent_player):
     )
 
     # Fractional fill planes
-    deadwood_plane = jnp.full((4, 13), deadwood, dtype=jnp.float32)
-    deck_plane = jnp.full((4, 13), deck_count, dtype=jnp.float32)
+    deadwood_plane = jnp.full((4, 13), deadwood, dtype=DTYPE)
+    deck_plane = jnp.full((4, 13), deck_count, dtype=DTYPE)
 
     obs = jnp.concatenate([
         hand_plane[None], discard_plane[None], opp_known_plane[None],
@@ -180,6 +198,7 @@ def _make_observation_alphazero(game_state, known_cards, agent_player):
 
 
 # Select observation function based on mode
+# Note: ORACLE_MODE is checked at module load time, so restart to change
 if OBS_MODE == "alphazero":
     @jax.jit
     def make_observation(game_state, known_cards, agent_player):
@@ -187,7 +206,7 @@ if OBS_MODE == "alphazero":
 else:
     @jax.jit
     def make_observation(game_state, known_cards, agent_player):
-        return _make_observation_standard(game_state, known_cards, agent_player)
+        return _make_observation_standard(game_state, known_cards, agent_player, oracle=ORACLE_MODE)
 
 
 @jax.jit
@@ -387,8 +406,10 @@ class ActorCriticCNN(nn.Module):
 
     Cards (156 dims) reshaped to 4x13 for spatial processing.
     Non-card features (11 dims) processed separately.
+    Uses bfloat16 for faster computation on A100.
     """
     action_dim: int = NUM_ACTIONS
+    dtype: jnp.dtype = DTYPE
 
     @nn.compact
     def __call__(self, obs):
@@ -396,6 +417,9 @@ class ActorCriticCNN(nn.Module):
         if not is_batched:
             obs = obs[None, :]
         batch_size = obs.shape[0]
+
+        # Ensure input is bf16
+        obs = obs.astype(self.dtype)
 
         # Split: 156 card dims + 11 other dims
         cards_flat = obs[:, :156]
@@ -405,32 +429,32 @@ class ActorCriticCNN(nn.Module):
         cards = cards_flat.reshape(batch_size, 3, 4, 13)
         x = jnp.transpose(cards, (0, 2, 3, 1))
 
-        # CNN for cards
-        x = nn.Conv(features=32, kernel_size=(1, 3), padding='SAME')(x)  # Runs
+        # CNN for cards (all layers use bf16)
+        x = nn.Conv(features=32, kernel_size=(1, 3), padding='SAME', dtype=self.dtype)(x)  # Runs
         x = nn.relu(x)
-        x = nn.Conv(features=32, kernel_size=(3, 1), padding='SAME')(x)  # Sets
+        x = nn.Conv(features=32, kernel_size=(3, 1), padding='SAME', dtype=self.dtype)(x)  # Sets
         x = nn.relu(x)
-        x = nn.Conv(features=64, kernel_size=(2, 2), padding='SAME')(x)
+        x = nn.Conv(features=64, kernel_size=(2, 2), padding='SAME', dtype=self.dtype)(x)
         x = nn.relu(x)
         x = x.reshape(batch_size, -1)
-        card_features = nn.Dense(128)(x)
+        card_features = nn.Dense(128, dtype=self.dtype)(x)
         card_features = nn.relu(card_features)
 
         # Dense for non-card features
-        other_features = nn.Dense(32)(other)
+        other_features = nn.Dense(32, dtype=self.dtype)(other)
         other_features = nn.relu(other_features)
 
         # Combine
         combined = jnp.concatenate([card_features, other_features], axis=-1)
 
         # Separate heads
-        actor_hidden = nn.Dense(128)(combined)
+        actor_hidden = nn.Dense(128, dtype=self.dtype)(combined)
         actor_hidden = nn.relu(actor_hidden)
-        logits = nn.Dense(self.action_dim)(actor_hidden)
+        logits = nn.Dense(self.action_dim, dtype=self.dtype)(actor_hidden)
 
-        critic_hidden = nn.Dense(128)(combined)
+        critic_hidden = nn.Dense(128, dtype=self.dtype)(combined)
         critic_hidden = nn.relu(critic_hidden)
-        value = nn.Dense(1)(critic_hidden)
+        value = nn.Dense(1, dtype=self.dtype)(critic_hidden)
 
         value = jnp.squeeze(value, axis=-1)
         if not is_batched:
@@ -442,6 +466,7 @@ class ActorCriticCNN(nn.Module):
 class ActorCriticAlphaZero(nn.Module):
     """AlphaZero-style CNN for 728-dim (14 planes) observation."""
     action_dim: int = NUM_ACTIONS
+    dtype: jnp.dtype = DTYPE
 
     @nn.compact
     def __call__(self, obs):
@@ -450,30 +475,33 @@ class ActorCriticAlphaZero(nn.Module):
             obs = obs[None, :]
         batch_size = obs.shape[0]
 
+        # Ensure input is bf16
+        obs = obs.astype(self.dtype)
+
         # Reshape to (B, 14, 4, 13) -> (B, 4, 13, 14)
         x = obs.reshape(batch_size, 14, 4, 13)
         x = jnp.transpose(x, (0, 2, 3, 1))
 
-        # 3-layer CNN
-        x = nn.Conv(features=64, kernel_size=(3, 3), padding='SAME')(x)
+        # 3-layer CNN (all layers use bf16)
+        x = nn.Conv(features=64, kernel_size=(3, 3), padding='SAME', dtype=self.dtype)(x)
         x = nn.relu(x)
-        x = nn.Conv(features=64, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.Conv(features=64, kernel_size=(3, 3), padding='SAME', dtype=self.dtype)(x)
         x = nn.relu(x)
-        x = nn.Conv(features=64, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.Conv(features=64, kernel_size=(3, 3), padding='SAME', dtype=self.dtype)(x)
         x = nn.relu(x)
 
         x = x.reshape(batch_size, -1)
-        x = nn.Dense(256)(x)
+        x = nn.Dense(256, dtype=self.dtype)(x)
         x = nn.relu(x)
 
         # Separate heads
-        actor_hidden = nn.Dense(128)(x)
+        actor_hidden = nn.Dense(128, dtype=self.dtype)(x)
         actor_hidden = nn.relu(actor_hidden)
-        logits = nn.Dense(self.action_dim)(actor_hidden)
+        logits = nn.Dense(self.action_dim, dtype=self.dtype)(actor_hidden)
 
-        critic_hidden = nn.Dense(128)(x)
+        critic_hidden = nn.Dense(128, dtype=self.dtype)(x)
         critic_hidden = nn.relu(critic_hidden)
-        value = nn.Dense(1)(critic_hidden)
+        value = nn.Dense(1, dtype=self.dtype)(critic_hidden)
 
         value = jnp.squeeze(value, axis=-1)
         if not is_batched:
@@ -560,10 +588,15 @@ def train(
     update_epochs=4,
     max_grad_norm=0.5,
     seed=42,
+    oracle=False,
 ):
     print(f"Training PPO (V2) on Gin Rummy", flush=True)
-    print(f"  Obs mode: {OBS_MODE} ({OBS_DIM} dims)", flush=True)
+    oracle_str = " [ORACLE]" if oracle else ""
+    print(f"  Obs mode: {OBS_MODE} ({OBS_DIM} dims){oracle_str}", flush=True)
     print(f"  Network: {'AlphaZero CNN' if OBS_MODE == 'alphazero' else 'Standard CNN'} + Separate heads", flush=True)
+    print(f"  Dtype: {DTYPE}", flush=True)
+    if oracle:
+        print(f"  Oracle: Agent sees opponent's actual hand (upper bound test)", flush=True)
     print(f"  num_envs={num_envs}, num_steps={num_steps}", flush=True)
     print(f"  total_timesteps={total_timesteps}", flush=True)
     print(f"  Devices: {jax.devices()}", flush=True)
@@ -572,7 +605,7 @@ def train(
 
     network = ActorCritic()
     key, init_key = jax.random.split(key)
-    dummy_obs = jnp.zeros((1, OBS_DIM))
+    dummy_obs = jnp.zeros((1, OBS_DIM), dtype=DTYPE)
     params = network.init(init_key, dummy_obs)
 
     tx = optax.chain(
@@ -735,7 +768,17 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--ent_coef", type=float, default=0.01)
     parser.add_argument("--num_minibatches", type=int, default=8)
+    parser.add_argument("--oracle", action="store_true",
+                        help="Oracle mode: agent sees opponent's actual hand")
     args = parser.parse_args()
+
+    # Set oracle mode (must redefine make_observation before JIT compilation)
+    if args.oracle:
+        # Override the module-level make_observation with oracle version
+        # Must use globals() to actually replace the module-level function
+        def _make_obs_oracle(game_state, known_cards, agent_player):
+            return _make_observation_standard(game_state, known_cards, agent_player, oracle=True)
+        globals()['make_observation'] = jax.jit(_make_obs_oracle)
 
     train(
         num_envs=args.num_envs,
@@ -745,4 +788,5 @@ if __name__ == "__main__":
         seed=args.seed,
         ent_coef=args.ent_coef,
         num_minibatches=args.num_minibatches,
+        oracle=args.oracle,
     )
