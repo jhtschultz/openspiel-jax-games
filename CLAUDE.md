@@ -16,7 +16,7 @@ Current bottleneck: `calculate_deadwood` is called multiple times per turn (once
 
 - `gin_rummy_jax.py` - **Unified implementation** with LUT optimizations, full game logic (knock/layoff/scoring), and pyspiel wrapper. 44k games/sec (290x vs C++).
 - `gin_rummy_core.py` - Standalone JAX Gin Rummy (no pyspiel, simplified step function). 60k games/sec (396x vs C++).
-- `ppo_gin_rummy_v3_fused.py` - **Main PPO training script**. Fused environment loop, bfloat16, 78k FPS.
+- `ppo_gin_rummy_v3_fused.py` - **Main PPO training script**. Fused environment loop, bfloat16, 92k FPS.
 - `ppo_gin_rummy_v2.py` - Previous PPO script (25k FPS, uses fori_loop).
 - `connect_four_jax.py` - JAX Connect Four implementation.
 - `benchmark.py` - Benchmark script for gin_rummy_core.py
@@ -142,30 +142,32 @@ Training a PPO agent against the simple bot using `ppo_gin_rummy_v3_fused.py`.
 - 167-dim observation: 52 hand + 52 discard pile + 52 known cards + 11 other features
 - Agent only plays strategic phases (FIRST_UPCARD, DRAW, DISCARD); optimal bot handles KNOCK/LAYOFF/WALL
 - **bfloat16** for all network operations
-- **Fused environment loop**: `scan(25)` replaces `fori_loop(100)` for 3.1x speedup
+- **Fused environment loop**: `scan(10)` replaces `fori_loop(100)` for 3.7x speedup
 
-**V3 Fused Results (50M steps in ~10 min):**
+**V3 Fused Results (30M steps in ~5 min):**
 ```
-Config: num_envs=4096, num_steps=128, ~78k FPS
-Final:  49.8M steps, 83.5% win rate (per-update)
+Config: num_envs=4096, num_steps=128, ~92k FPS
+Final:  31.5M steps, 81.1% win rate (per-update)
 ```
 
 | Steps | Win Rate | FPS | Notes |
 |-------|----------|-----|-------|
-| 0.5M | 0.5% | 8k | Warmup |
-| 5M | 15% | 44k | Rapid learning |
-| 15M | 75% | 65k | Strong play |
-| 50M | **83.5%** | **78k** | Steady-state |
+| 0.5M | 0.4% | 8k | Warmup |
+| 5M | 14% | 50k | Rapid learning |
+| 15M | 75% | 78k | Strong play |
+| 30M | **81%** | **92k** | Steady-state |
 
 **Version Comparison:**
 | Version | FPS | Speedup | Key Change |
 |---------|-----|---------|------------|
 | V2 (fori_loop) | 25k | 1x | 100-iter loop with early exit |
-| V3 (fused scan) | 78k | **3.1x** | 25-iter scan, always compute + mask |
+| V3 scan(25) | 78k | 3.1x | 25-iter scan, always compute + mask |
+| V3 scan(10) | 92k | **3.7x** | 10-iter scan, less wasted computation |
 
 **Observations:**
-- Fused scan + bfloat16 = 3.1x faster training
-- Agent reaches 83% win rate against optimal-strategy bot
+- Fused scan(10) + bfloat16 = 3.7x faster training
+- Shorter scan = less wasted computation when games end early
+- Agent reaches 81% win rate against optimal-strategy bot
 - Per-update win rate tracking (not cumulative) for accurate progress
 
 ## GCP Setup

@@ -256,9 +256,9 @@ def env_step_fused(env_state, action):
         
         return (state, k_cards, k), None
 
-    # Unroll 25 times
+    # Unroll 10 times (enough for mid-game: opponent turn + endgame phases)
     (game_state, known_cards, key), _ = jax.lax.scan(
-        loop_body, (game_state, known_cards, key), None, length=25
+        loop_body, (game_state, known_cards, key), None, length=10
     )
 
     # --- 3. Finalize ---
@@ -421,7 +421,7 @@ def train(
     seed=42,
 ):
     print(f"Training PPO (V3 Fused) on Gin Rummy", flush=True)
-    print(f"  Unrolled Environment Loop (25 steps)", flush=True)
+    print(f"  Unrolled Environment Loop (10 steps)", flush=True)
     
     key = jax.random.PRNGKey(seed)
     network = ActorCritic()
