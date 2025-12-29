@@ -98,9 +98,10 @@ Uses precomputed 8192-entry LUT for run scoring, with full scenario enumeration:
 |---------|-----------|--------|
 | C++ SimpleGinRummyBot | 153 | 1x |
 | JAX simple_bot_action (batch=10000) | 24,026 | 157x |
-| **JAX simple_bot_action_opt (batch=20000)** | **60,646** | **396x** |
+| JAX simple_bot_action_opt (batch=20000) | 60,646 | 396x |
+| **JAX with optimal melds (batch=20000)** | **2,584** | **17x** |
 
-Simple bot uses **exact 216-scenario algorithm** - verified 100% correct against C++ (54,336 checks, 0 disagreements). Optimized version uses loop compression (11 vs 52 iterations) and O(1) meld check via LUT.
+Simple bot uses **exact 216-scenario algorithm** with `optimal_melds_mask` for C++ compatibility. Verified 100% correct against C++ (50+ games, 0 disagreements). Performance dropped from 396x to 17x due to computing optimal melds (185 deadwood calculations per meld decision).
 
 ## Performance History
 
@@ -122,6 +123,7 @@ Track each optimization attempt here. Always benchmark on A100 GPU with `python 
 | 2025-12-28 | **Exact 216-scenario** (3 sets + 4-split, batch=10000) | **24,026** | **157x vs C++, 100% correct** |
 | 2025-12-28 | **Squeezed Juice** (11 vs 52 loop, O(1) meld check, batch=20000) | **60,646** | **2.5x vs previous, 396x vs C++** |
 | 2025-12-28 | **Merged gin_rummy_jax.py** (full game logic + LUT optimizations) | **44,357** | **290x vs C++, games complete with scoring** |
+| 2025-12-29 | **Optimal melds fix** (3-set deadwood + optimal_melds_mask for C++ compat) | **2,584** | **17x vs C++, 100% correct** |
 
 ### Optimization Ideas to Try
 - [x] LUT-based exact deadwood (implemented)
@@ -131,6 +133,8 @@ Track each optimization attempt here. Always benchmark on A100 GPU with `python 
 - [x] **Exact 216-scenario**: handles 3 sets + 4-card splitting, 100% correct!
 - [x] **Squeezed Juice**: loop compression (11 vs 52), O(1) meld check via RUN_MEMBER_LUT
 - [x] **Compute-based deadwood** (FAILED - see below)
+- [x] **Optimal melds fix** (required for C++ compatibility - see below)
+- [ ] Optimize optimal_melds_mask (currently 185 deadwood calculations per call)
 - [ ] Profile with JAX profiler to identify remaining hotspots
 
 ### Failed Optimization: Compute-Based Deadwood (2025-12-29)
@@ -173,6 +177,26 @@ def _compute_run_score_alu_ultra(x):
 4. Even unrolled, 13 shifts + 13 ANDs + 13 multiplies + 12 adds > 1 cached gather
 
 **Conclusion:** LUT-based approach is optimal for this problem size. The gather operations are not the bottleneck - the 8KB table stays hot in cache across the batch.
+
+### Correctness Fix: Optimal Melds (2025-12-29)
+
+**Problem:** JAX allowed laying any meld where all cards were present, but C++ OpenSpiel only allows melds that are part of the **optimal** meld decomposition. This caused action disagreements in KNOCK/LAYOFF phases.
+
+**Example:** Hand with Ts, Qs, 5c, 7c, Tc, 5d, Qd, 5h, Th, Qh
+- Valid melds: 5s set (5c-5d-5h), 10s set (Ts-Tc-Th), Qs set (Qs-Qd-Qh)
+- C++ only allowed these 3 specific melds (optimal decomposition = 7 deadwood)
+- JAX was trying to pass because `calculate_deadwood_lut` only checked 2 sets, returning wrong deadwood
+
+**Fixes applied:**
+1. `calculate_deadwood_lut`: Now uses 216-scenario (3 sets) instead of 2-set enumeration
+2. `optimal_melds_mask(hand)`: Returns which melds don't increase deadwood when laid
+3. `legal_actions_mask`: Uses optimal_melds instead of valid_melds for KNOCK/LAYOFF phases
+4. `simple_bot_action_opt`: Uses optimal_melds for meld selection
+
+**Performance impact:** 396x → 17x (23x slower)
+- `optimal_melds_mask` computes 185 deadwood values (one per possible meld)
+- Each deadwood calculation uses 216-scenario enumeration
+- Future optimization: precompute which cards are in optimal melds during initial deadwood calc
 
 ## PPO Training Results (A100 GPU)
 

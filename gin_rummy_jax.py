@@ -84,6 +84,15 @@ def make_card(suit, rank):
     return suit * NUM_RANKS + rank
 
 
+def card_str(card):
+    """Convert card index to human-readable string (e.g., 'As', '2c', 'Kh')."""
+    suit = card // NUM_RANKS
+    rank = card % NUM_RANKS
+    rank_chars = 'A23456789TJQK'
+    suit_chars = 'scdh'  # spades, clubs, diamonds, hearts
+    return rank_chars[rank] + suit_chars[suit]
+
+
 def generate_all_melds():
     """Generate all valid melds (sets and runs).
 
@@ -309,56 +318,67 @@ def hand_to_4x13(hand):
     return hand.reshape(4, 13)
 
 @jax.jit
-def _compute_max_meld_points(rank_nibbles, base_suits):
-    """Core meld computation shared by single and all-discards versions."""
+def _compute_max_meld_points_3sets(hand_4x13):
+    """Compute max meld points considering up to 3 set candidates.
+
+    Uses 216-scenario enumeration (6 options per set × 3 sets).
+    """
+    rank_nibbles = jnp.dot(SUIT_POWERS, hand_4x13.astype(jnp.int32))  # (13,)
     rank_counts = NIBBLE_POPCOUNTS[rank_nibbles]
-    is_set_candidate = rank_counts >= 3
 
-    set_indices = jnp.argsort(~is_set_candidate)[:2]
-    held_masks = rank_nibbles[set_indices]
+    is_candidate = rank_counts >= 3
+    set_indices = jnp.argsort(~is_candidate)[:3]  # Top 3 ranks
+    set_nibbles = rank_nibbles[set_indices]  # (3,) held cards per candidate
 
-    # Valid set modes: (2, 16)
-    subset_check = (held_masks[:, None] & ALL_NIBBLES[None, :]) == ALL_NIBBLES[None, :]
-    valid_size = (NIBBLE_POPCOUNTS[None, :] >= 3) | (ALL_NIBBLES[None, :] == 0)
-    valid_set_modes = subset_check & valid_size
+    # Get options per candidate (6 options each: skip, 4 3-card subsets, 4-card)
+    options = SUBSET_TABLE[set_nibbles]  # (3, 6)
 
-    # Check combo validity using precomputed grids
-    combo_valid = valid_set_modes[0, GRID_A] & valid_set_modes[1, GRID_B]
+    # Build 216 scenarios using precomputed indices
+    mask_A = options[0, SCENARIO_IDX_A]  # (216,)
+    mask_B = options[1, SCENARIO_IDX_B]  # (216,)
+    mask_C = options[2, SCENARIO_IDX_C]  # (216,)
 
-    # Points from sets
-    val_A = RANK_VALUES[set_indices[0]]
-    val_B = RANK_VALUES[set_indices[1]]
-    points_sets = (POPCNT_A * val_A) + (POPCNT_B * val_B)
+    # Set points per scenario
+    pts_A = NIBBLE_POPCOUNTS[mask_A].astype(jnp.int16) * RANK_VALUES_16[set_indices[0]]
+    pts_B = NIBBLE_POPCOUNTS[mask_B].astype(jnp.int16) * RANK_VALUES_16[set_indices[1]]
+    pts_C = NIBBLE_POPCOUNTS[mask_C].astype(jnp.int16) * RANK_VALUES_16[set_indices[2]]
+    scenario_set_pts = pts_A + pts_B + pts_C  # (216,)
 
-    # Build removal masks using precomputed suit expansions
-    shift_A = set_indices[0]
-    shift_B = set_indices[1]
-    suits_A = NIBBLE_TO_SUITS[GRID_A]  # (256, 4)
-    suits_B = NIBBLE_TO_SUITS[GRID_B]  # (256, 4)
-    remove_masks = (suits_A << shift_A) | (suits_B << shift_B)
+    # Build removal masks for runs
+    def to_suit_removal(mask, rank_idx):
+        bits = jnp.stack([((mask >> i) & 1) for i in range(4)], axis=-1).astype(jnp.int16)
+        return bits * (jnp.int16(1) << rank_idx)
 
-    # Apply removal and lookup
-    final_suits = base_suits[None, :] & (~remove_masks)
-    run_scores = RUN_SCORE_LUT[final_suits]
-    total_run_points = jnp.sum(run_scores, axis=1)
+    rem_A = to_suit_removal(mask_A, set_indices[0])  # (216, 4)
+    rem_B = to_suit_removal(mask_B, set_indices[1])
+    rem_C = to_suit_removal(mask_C, set_indices[2])
+    total_removal = rem_A | rem_B | rem_C  # (216, 4)
 
-    # Total meld points
-    total_meld_points = points_sets + total_run_points
-    valid_meld_points = jnp.where(combo_valid, total_meld_points, -1)
-    return jnp.max(valid_meld_points)
+    # Base suit bitmasks
+    base_suits = jnp.dot(hand_4x13.astype(jnp.int16), POWERS_OF_2_16)  # (4,)
+
+    # Apply removal to get scenario suit configs
+    scenario_suits = base_suits[None, :] & (~total_removal)  # (216, 4)
+
+    # Lookup run scores for each scenario
+    run_scores = RUN_SCORE_LUT[scenario_suits]  # (216, 4)
+    run_total = jnp.sum(run_scores, axis=1)  # (216,)
+
+    # Total meld points per scenario
+    total_meld_pts = scenario_set_pts + run_total  # (216,)
+
+    return jnp.max(total_meld_pts)
+
 
 @jax.jit
 def calculate_deadwood_lut(hand):
-    """Calculate exact deadwood using LUT + set enumeration.
+    """Calculate exact deadwood using LUT + 3-set enumeration.
 
-    This is the fast version using lookup tables. Use this instead of
-    calculate_deadwood() for performance.
+    Handles up to 3 set candidates using 216-scenario approach.
+    This is the fast version using lookup tables.
     """
     hand_4x13 = hand_to_4x13(hand)
-    rank_nibbles = jnp.dot(SUIT_POWERS, hand_4x13.astype(jnp.int32))
-    base_suits = jnp.dot(hand_4x13.astype(jnp.int32), POWERS_OF_2)
-
-    max_meld_points = _compute_max_meld_points(rank_nibbles, base_suits)
+    max_meld_points = _compute_max_meld_points_3sets(hand_4x13)
     total_hand_value = jnp.sum(hand_4x13.astype(jnp.int32) * RANK_VALUES[None, :])
     return total_hand_value - max_meld_points
 
@@ -599,17 +619,29 @@ def simple_bot_action_opt(state):
     can_knock = min_dw_hand <= KNOCK_THRESHOLD
     discard_action = jnp.where(can_knock, ACTION_KNOCK, best_discard_card)
 
-    # Knock action
+    # Knock action: discard if 11 cards, else lay optimal melds, else pass
     hand_size = jnp.sum(hand)
-    knock_action = jnp.where(hand_size >= 11, best_discard_card, ACTION_PASS)
+    optimal_melds = optimal_melds_mask(hand)
+    has_meld_to_lay = jnp.any(optimal_melds)
+    # Pick highest-value optimal meld (greedy)
+    meld_values = jnp.where(optimal_melds, MELD_POINTS, jnp.int32(-1))
+    best_meld_idx = jnp.argmax(meld_values)
+    meld_action = ACTION_MELD_BASE + best_meld_idx
+    knock_action = jnp.where(hand_size >= 11, best_discard_card,
+                             jnp.where(has_meld_to_lay, meld_action, ACTION_PASS))
 
     # Wall action
     wall_can_knock = min_dw_with_upcard <= KNOCK_THRESHOLD
     wall_action = jnp.where(wall_can_knock & (upcard >= 0), ACTION_KNOCK, ACTION_PASS)
 
-    # Layoff action - simple strategy: always pass (skip layoffs and own melds)
-    # This is not optimal but allows games to complete
-    layoff_action = ACTION_PASS
+    # Layoff action: pass on laying off cards, but lay own optimal melds
+    # Check if we're in pre-finish (layoffs) or post-finish (own melds) stage
+    finished_layoffs = state['finished_layoffs']
+    knocker_deadwood = state['knocker_deadwood']
+    is_gin = knocker_deadwood == 0
+    effectively_finished = finished_layoffs | is_gin
+    # In post-finish: lay optimal melds if any, else pass
+    layoff_action = jnp.where(effectively_finished & has_meld_to_lay, meld_action, ACTION_PASS)
 
     # Multiplexer
     action = jnp.where(is_chance, chance_action, jnp.int32(0))
@@ -684,6 +716,33 @@ def valid_melds_mask(hand):
     meld_card_counts = jnp.sum(MELD_MASKS * hand_expanded, axis=1)
     meld_sizes = jnp.sum(MELD_MASKS, axis=1)
     return meld_card_counts == meld_sizes
+
+
+@jax.jit
+def optimal_melds_mask(hand):
+    """Return mask of melds that are part of the optimal decomposition.
+
+    A meld is "optimal" if laying it doesn't increase the minimum deadwood.
+    This matches C++ OpenSpiel behavior which only allows optimal melds
+    during KNOCK and LAYOFF phases.
+
+    Returns:
+        Boolean array of shape (185,) where True means the meld can be laid
+        without increasing deadwood.
+    """
+    current_dw = calculate_deadwood_lut(hand)
+
+    # Check if all meld cards are present in hand
+    has_all = jnp.all(hand[None, :] >= MELD_MASKS, axis=1)  # (185,)
+
+    # Compute remaining hands after laying each meld: (185, 52)
+    remaining_hands = jnp.maximum(hand[None, :] - MELD_MASKS, 0)
+
+    # Compute deadwood for all remaining hands
+    remaining_dws = jax.vmap(calculate_deadwood_lut)(remaining_hands)  # (185,)
+
+    # Meld is optimal if: has all cards AND deadwood unchanged after laying it
+    return has_all & (remaining_dws == current_dw)
 
 
 @jax.jit
@@ -1058,6 +1117,9 @@ def legal_actions_mask(state):
     # Calculate deadwood for knock eligibility (using LUT for speed)
     deadwood = calculate_deadwood_lut(hand)
     valid_melds = valid_melds_mask(hand)
+    # For KNOCK and LAYOFF phases, only allow melds that are part of optimal decomposition
+    # This matches C++ OpenSpiel behavior
+    optimal_melds = optimal_melds_mask(hand)
 
     # Stock info
     stock_count = jnp.sum(state['deck'])
@@ -1109,11 +1171,11 @@ def legal_actions_mask(state):
     knock_discard_mask = (hand > 0) & (all_deadwoods <= KNOCK_THRESHOLD)
     mask = jnp.where(knock_phase & has_11_cards, mask.at[:NUM_CARDS].set(knock_discard_mask), mask)
 
-    # With 10 or fewer cards: can lay valid melds
+    # With 10 or fewer cards: can lay optimal melds (melds that don't increase deadwood)
     # Rule: can pass once remaining hand's total points <= KNOCK_THRESHOLD (10)
     # (Cards are removed from hand when melds are laid, remaining cards are all deadwood)
     knock_10 = knock_phase & (hand_count <= 10)
-    meld_mask = knock_10 & valid_melds
+    meld_mask = knock_10 & optimal_melds
     # Calculate raw point total of remaining cards (no meld optimization - these ARE the deadwood)
     remaining_points = hand_total_points(hand)
     can_pass_knock = remaining_points <= KNOCK_THRESHOLD
@@ -1142,10 +1204,10 @@ def legal_actions_mask(state):
     mask = jnp.where(pre_finish, mask.at[:NUM_CARDS].set(layoff_card_mask), mask)
     mask = jnp.where(pre_finish, mask.at[ACTION_PASS].set(True), mask)
 
-    # After finishing layoffs: can lay own melds or pass
+    # After finishing layoffs: can lay own optimal melds or pass
     post_finish = layoff_phase & finished
     mask = jnp.where(post_finish, mask.at[ACTION_PASS].set(True), mask)
-    meld_mask_layoff = post_finish & valid_melds
+    meld_mask_layoff = post_finish & optimal_melds
     mask = jnp.where(post_finish, mask.at[ACTION_MELD_BASE:ACTION_MELD_BASE + NUM_MELDS].set(meld_mask_layoff), mask)
 
     return mask

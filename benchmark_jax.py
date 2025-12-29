@@ -151,7 +151,35 @@ def verify_vs_cpp_jax(n_games=50):
                 # Verify it's legal in both
                 cpp_legal = set(cpp_state.legal_actions())
                 if action not in cpp_legal:
-                    print(f"Game {game_idx}: Action {action} not legal in C++")
+                    phase = jax_state['phase'].item()
+                    phase_names = ['DEAL', 'FIRST_UPCARD', 'DRAW', 'DISCARD', 'KNOCK', 'LAYOFF', 'WALL', 'GAME_OVER']
+                    phase_name = phase_names[phase] if 0 <= phase < len(phase_names) else f"UNKNOWN({phase})"
+                    player = jax_state['current_player'].item()
+                    hand = gin.get_hand(jax_state, player)
+                    hand_cards = [i for i in range(52) if hand[i] > 0]
+                    hand_str = ", ".join(gin.card_str(c) for c in hand_cards)
+                    print(f"Game {game_idx} Step {_}: Action {action} not legal in C++")
+                    print(f"  Phase: {phase_name}, Player: {player}")
+                    print(f"  C++ legal: {cpp_legal}")
+                    print(f"  Hand ({len(hand_cards)} cards): {hand_str}")
+                    print(f"  finished_layoffs: {jax_state['finished_layoffs'].item()}")
+                    print(f"  knocker: {jax_state['knocker'].item()}")
+                    print(f"  knocker_deadwood: {jax_state['knocker_deadwood'].item()}")
+                    # Debug optimal_melds
+                    current_dw = gin.calculate_deadwood_lut(hand)
+                    optimal_m = gin.optimal_melds_mask(hand)
+                    valid_m = gin.valid_melds_mask(hand)
+                    n_optimal = int(jnp.sum(optimal_m))
+                    n_valid = int(jnp.sum(valid_m))
+                    print(f"  current_deadwood: {int(current_dw)}")
+                    print(f"  n_valid_melds: {n_valid}, n_optimal_melds: {n_optimal}")
+                    if n_valid > 0 and n_optimal == 0:
+                        # Check first few valid melds
+                        valid_indices = [i for i in range(185) if valid_m[i]][:5]
+                        for mi in valid_indices:
+                            remaining = jnp.maximum(hand - gin.MELD_MASKS[mi], 0)
+                            rem_dw = gin.calculate_deadwood_lut(remaining)
+                            print(f"    Meld {mi}: remaining_dw={int(rem_dw)} (should equal {int(current_dw)})")
                     disagreements += 1
                     break
 
