@@ -13,6 +13,12 @@ Unrolled Sequence:
 
 Since we automated the Agent's endgame (Knock/Layoff), we can guarantee
 a strict turn structure for the "Strategic" phases (Draw/Discard).
+
+Checkpointing:
+- Uses orbax to save/restore training state
+- Saves every CHECKPOINT_EVERY updates (default 10)
+- Automatically resumes from latest checkpoint if available
+- Run with --fresh to start from scratch
 """
 
 import jax
@@ -22,6 +28,12 @@ import optax
 from functools import partial
 from typing import NamedTuple
 import time
+import os
+import argparse
+
+# Orbax checkpointing
+import orbax.checkpoint as ocp
+from flax.training import orbax_utils
 
 # Use bfloat16 for speed
 DTYPE = jnp.bfloat16
@@ -35,6 +47,10 @@ import gin_rummy_jax as gin
 NUM_ACTIONS = 241
 OBS_MODE = "standard"  # Keep standard for now to isolate speedup
 OBS_DIM = 167
+
+# Checkpointing
+CHECKPOINT_DIR = os.path.expanduser("~/checkpoints/ppo_gin_rummy_v3")
+CHECKPOINT_EVERY = 10  # Save every N updates
 
 # =============================================================================
 # Transition storage
@@ -419,10 +435,35 @@ def train(
     total_timesteps=50_000_000,  # More steps to see steady-state
     learning_rate=3e-4,
     seed=42,
+    fresh=False,  # If True, ignore existing checkpoints
+    checkpoint_dir=CHECKPOINT_DIR,
 ):
     print(f"Training PPO (V3 Fused) on Gin Rummy", flush=True)
     print(f"  Unrolled Environment Loop (10 steps)", flush=True)
-    
+
+    # ==========================================================================
+    # Setup checkpoint manager
+    # ==========================================================================
+    # Orbax requires absolute paths
+    checkpoint_dir = os.path.abspath(os.path.expanduser(checkpoint_dir))
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"  Checkpoint dir: {checkpoint_dir}", flush=True)
+
+    # Create checkpoint manager with orbax
+    checkpointer = ocp.PyTreeCheckpointer()
+    options = ocp.CheckpointManagerOptions(
+        max_to_keep=3,
+        save_interval_steps=CHECKPOINT_EVERY,
+    )
+    ckpt_manager = ocp.CheckpointManager(
+        checkpoint_dir,
+        checkpointer,
+        options=options,
+    )
+
+    # ==========================================================================
+    # Initialize or restore
+    # ==========================================================================
     key = jax.random.PRNGKey(seed)
     network = ActorCritic()
     key, init_key = jax.random.split(key)
@@ -431,8 +472,26 @@ def train(
     opt_state = tx.init(params)
     apply_fn = jax.jit(network.apply)
 
+    start_update = 0
+
+    # Try to restore from checkpoint
+    latest_step = ckpt_manager.latest_step()
+    if latest_step is not None and not fresh:
+        print(f"Restoring from checkpoint at update {latest_step}...", flush=True)
+        ckpt = ckpt_manager.restore(latest_step)
+        params = ckpt['params']
+        opt_state = ckpt['opt_state']
+        start_update = ckpt['update'] + 1
+        # Restore key state for reproducibility
+        key = jax.random.PRNGKey(seed + start_update * 1000)
+        print(f"Resumed from update {latest_step}, continuing from update {start_update}", flush=True)
+    elif fresh and latest_step is not None:
+        print(f"--fresh specified, ignoring checkpoint at update {latest_step}", flush=True)
+    else:
+        print("No checkpoint found, starting from scratch", flush=True)
+
     # Init envs
-    print("Initializing...", flush=True)
+    print("Initializing environments...", flush=True)
     key, *keys = jax.random.split(key, num_envs + 1)
     env_states = jax.vmap(env_init)(jnp.stack(keys))
 
@@ -501,17 +560,57 @@ def train(
     # Train loop
     num_updates = total_timesteps // (num_envs * num_steps)
     start = time.time()
-    for i in range(num_updates):
+
+    # Adjust timing for resumed training
+    steps_before_resume = start_update * num_envs * num_steps
+
+    for i in range(start_update, num_updates):
         key, r_key, u_key = jax.random.split(key, 3)
         env_states, traj, _ = collect_rollout(params, env_states, r_key)
         params, opt_state, loss, aux = update(params, opt_state, traj, u_key)
-        
-        if i % 1 == 0:  # Print every update
-            elapsed = time.time() - start
-            steps = (i+1) * num_envs * num_steps
-            games = max(int(traj.done.sum()), 1)
-            wins = int((traj.reward > 0).sum())
-            print(f"Update {i} | Steps: {steps/1e6:.1f}M | FPS: {steps/elapsed:,.0f} | Win: {wins/games:.1%} | Loss: {loss:.4f}", flush=True)
+
+        # Print progress
+        elapsed = time.time() - start
+        steps = (i + 1) * num_envs * num_steps
+        steps_this_session = steps - steps_before_resume
+        games = max(int(traj.done.sum()), 1)
+        wins = int((traj.reward > 0).sum())
+        fps = steps_this_session / elapsed if elapsed > 0 else 0
+        print(f"Update {i} | Steps: {steps/1e6:.1f}M | FPS: {fps:,.0f} | Win: {wins/games:.1%} | Loss: {loss:.4f}", flush=True)
+
+        # Save checkpoint periodically
+        if (i + 1) % CHECKPOINT_EVERY == 0:
+            ckpt = {
+                'params': params,
+                'opt_state': opt_state,
+                'update': i,
+            }
+            ckpt_manager.save(i, ckpt)
+            print(f"  Saved checkpoint at update {i}", flush=True)
+
+    # Final checkpoint
+    print("Training complete!", flush=True)
+    final_ckpt = {
+        'params': params,
+        'opt_state': opt_state,
+        'update': num_updates - 1,
+    }
+    ckpt_manager.save(num_updates - 1, final_ckpt, force=True)
+    print(f"Saved final checkpoint at update {num_updates - 1}", flush=True)
+
+    # Wait for checkpoint to be written
+    ckpt_manager.wait_until_finished()
+
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description="PPO Training for Gin Rummy")
+    parser.add_argument("--fresh", action="store_true", help="Start fresh, ignore existing checkpoints")
+    parser.add_argument("--steps", type=int, default=50_000_000, help="Total training timesteps")
+    parser.add_argument("--checkpoint-dir", type=str, default=CHECKPOINT_DIR, help="Checkpoint directory")
+    args = parser.parse_args()
+
+    train(
+        total_timesteps=args.steps,
+        fresh=args.fresh,
+        checkpoint_dir=args.checkpoint_dir,
+    )

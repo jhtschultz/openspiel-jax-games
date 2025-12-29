@@ -214,6 +214,25 @@ Training a PPO agent against the simple bot using `ppo_gin_rummy_v3_fused.py`.
 - Agent only plays strategic phases (FIRST_UPCARD, DRAW, DISCARD); optimal bot handles KNOCK/LAYOFF/WALL
 - **bfloat16** for all network operations
 - **Fused environment loop**: `scan(10)` replaces `fori_loop(100)` for 3.7x speedup
+- **Orbax checkpointing**: saves/restores training state for resumable training
+
+### Training Commands
+
+```bash
+# Start training (auto-resumes from checkpoint if exists)
+python ppo_gin_rummy_v3_fused.py
+
+# Start fresh, ignoring existing checkpoints
+python ppo_gin_rummy_v3_fused.py --fresh
+
+# Custom step count
+python ppo_gin_rummy_v3_fused.py --steps 100000000
+
+# Custom checkpoint directory
+python ppo_gin_rummy_v3_fused.py --checkpoint-dir ./my_checkpoints
+```
+
+Checkpoints are saved every 10 updates to `./checkpoints/ppo_gin_rummy_v3/`. The last 3 checkpoints are kept.
 
 **V3 Fused Results (30M steps in ~5 min):**
 ```
