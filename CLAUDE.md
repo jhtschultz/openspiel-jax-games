@@ -130,7 +130,49 @@ Track each optimization attempt here. Always benchmark on A100 GPU with `python 
 - [x] Delta Lookups v3 (fast but incorrect for edge cases)
 - [x] **Exact 216-scenario**: handles 3 sets + 4-card splitting, 100% correct!
 - [x] **Squeezed Juice**: loop compression (11 vs 52), O(1) meld check via RUN_MEMBER_LUT
+- [x] **Compute-based deadwood** (FAILED - see below)
 - [ ] Profile with JAX profiler to identify remaining hotspots
+
+### Failed Optimization: Compute-Based Deadwood (2025-12-29)
+
+**Hypothesis:** Replace `RUN_SCORE_LUT[suit_mask]` gather operations with pure ALU bitwise logic. Modern GPUs can do ~100 integer ops per memory fetch, so compute-heavy/memory-light should be faster.
+
+**Approach 1: Hybrid (keep 216-scenario, replace LUT)**
+```python
+def _compute_run_scores_alu(suit_masks):
+    x = suit_masks.astype(jnp.int32)
+    # Detect run starts: bit i set if i, i+1, i+2 all held
+    r3 = x & (x >> 1) & (x >> 2)
+    # Expand to all cards in runs
+    in_run_mask = (r3 | (r3 << 1) | (r3 << 2)) & 8191
+    # Extract bits and sum weighted by rank value
+    bits = (in_run_mask[..., None] >> jnp.arange(13)) & 1
+    scores = jnp.sum(bits * RANK_VALUES, axis=-1)
+    return scores.astype(jnp.int16)
+```
+- ✅ 100% correct (verified against LUT for all 8192 masks)
+- ❌ **27k games/sec** vs LUT baseline 37k (27% slower)
+
+**Approach 2: Ultra (unrolled summation, deduplicated scenarios)**
+```python
+def _compute_run_score_alu_ultra(x):
+    r3 = x & (x >> 1) & (x >> 2)
+    in_run = (r3 | (r3 << 1) | (r3 << 2)) & 0x1FFF
+    # Unrolled to avoid tensor expansion
+    s = ((in_run >> 0) & 1) * 1
+    s += ((in_run >> 1) & 1) * 2
+    # ... (13 terms)
+    return s.astype(jnp.int16)
+```
+- ❌ **16k games/sec** (57% slower than LUT)
+
+**Why it failed:**
+1. The 8KB `RUN_SCORE_LUT` fits entirely in L1 cache on A100
+2. Cached gathers are nearly free compared to ALU
+3. The bit extraction `(mask >> jnp.arange(13)) & 1` creates intermediate tensors
+4. Even unrolled, 13 shifts + 13 ANDs + 13 multiplies + 12 adds > 1 cached gather
+
+**Conclusion:** LUT-based approach is optimal for this problem size. The gather operations are not the bottleneck - the 8KB table stays hot in cache across the batch.
 
 ## PPO Training Results (A100 GPU)
 
