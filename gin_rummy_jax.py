@@ -305,6 +305,90 @@ def _build_run_member_table():
 RUN_MEMBER_LUT = _build_run_member_table()  # (8192,)
 RUN_SCORE_LUT_8 = RUN_SCORE_LUT.astype(jnp.int8)
 
+
+def _build_run_decomposition_table():
+    """Build (8192, 5) table: optimal run meld IDs for each suit config.
+
+    For suit 0 (spades), returns actual meld IDs. Adjust for other suits at runtime.
+    Meld ID encoding:
+    - 3-card runs: 65 + suit*11 + start_rank
+    - 4-card runs: 109 + suit*10 + start_rank
+    - 5-card runs: 149 + suit*9 + start_rank
+
+    Uses greedy decomposition: for each maximal run, split into valid melds.
+    """
+    lut = []
+    for bits in range(8192):
+        held = [(bits >> i) & 1 for i in range(13)]
+
+        # Find maximal runs
+        runs = []  # List of (start, length)
+        i = 0
+        while i < 13:
+            if held[i]:
+                start = i
+                while i < 13 and held[i]:
+                    i += 1
+                length = i - start
+                if length >= 3:
+                    runs.append((start, length))
+            else:
+                i += 1
+
+        # Decompose each run into 3/4/5 card melds using DP for optimal
+        # Actually use greedy: prefer splitting into 3s first
+        meld_ids = []
+        for start, length in runs:
+            pos = start
+            remaining = length
+            while remaining >= 3:
+                if remaining == 3:
+                    # 3-card run
+                    meld_ids.append(65 + pos)  # For suit 0
+                    pos += 3
+                    remaining -= 3
+                elif remaining == 4:
+                    # 4-card run
+                    meld_ids.append(109 + pos)
+                    pos += 4
+                    remaining -= 4
+                elif remaining == 5:
+                    # 5-card run
+                    meld_ids.append(149 + pos)
+                    pos += 5
+                    remaining -= 5
+                elif remaining == 6:
+                    # Two 3-card runs
+                    meld_ids.append(65 + pos)
+                    meld_ids.append(65 + pos + 3)
+                    remaining = 0
+                elif remaining == 7:
+                    # 3 + 4
+                    meld_ids.append(65 + pos)
+                    meld_ids.append(109 + pos + 3)
+                    remaining = 0
+                elif remaining == 8:
+                    # 3 + 5 or 4 + 4 (both valid, prefer 3+5 for consistency)
+                    meld_ids.append(65 + pos)
+                    meld_ids.append(149 + pos + 3)
+                    remaining = 0
+                elif remaining >= 9:
+                    # 3 + 3 + ... (take a 3-card run, continue)
+                    meld_ids.append(65 + pos)
+                    pos += 3
+                    remaining -= 3
+
+        # Pad to 5 entries
+        while len(meld_ids) < 5:
+            meld_ids.append(-1)
+
+        lut.append(meld_ids[:5])
+
+    return jnp.array(lut, dtype=jnp.int32)
+
+
+RUN_DECOMP_LUT = _build_run_decomposition_table()  # (8192, 5)
+
 # Precompute the 216 scenario indices
 _idx6 = jnp.arange(6)
 _grid_A_216, _grid_B_216, _grid_C_216 = jnp.meshgrid(_idx6, _idx6, _idx6, indexing='ij')
@@ -318,10 +402,12 @@ def hand_to_4x13(hand):
     return hand.reshape(4, 13)
 
 @jax.jit
-def _compute_max_meld_points_3sets(hand_4x13):
-    """Compute max meld points considering up to 3 set candidates.
+def _compute_optimal_meld_info(hand_4x13):
+    """Compute optimal meld decomposition and return melded cards mask.
 
-    Uses 216-scenario enumeration (6 options per set × 3 sets).
+    Returns:
+        max_meld_points: Total points from optimal melds
+        melded_cards: (52,) int8 mask of cards used in optimal decomposition
     """
     rank_nibbles = jnp.dot(SUIT_POWERS, hand_4x13.astype(jnp.int32))  # (13,)
     rank_counts = NIBBLE_POPCOUNTS[rank_nibbles]
@@ -367,7 +453,89 @@ def _compute_max_meld_points_3sets(hand_4x13):
     # Total meld points per scenario
     total_meld_pts = scenario_set_pts + run_total  # (216,)
 
-    return jnp.max(total_meld_pts)
+    # Find best scenario
+    best_idx = jnp.argmax(total_meld_pts)
+    max_meld_points = total_meld_pts[best_idx]
+
+    # Extract which SPECIFIC melds are used in best scenario
+    # Returns a (185,) boolean mask of meld indices
+
+    best_mask_A = mask_A[best_idx]  # 4-bit nibble (which suits used for set A)
+    best_mask_B = mask_B[best_idx]
+    best_mask_C = mask_C[best_idx]
+
+    # 1. Compute set meld indices
+    # For 3-card set: meld_id = rank * 5 + missing_suit
+    # For 4-card set: meld_id = rank * 5 + 4
+    def get_set_meld_id(nibble_mask, rank):
+        popcount = NIBBLE_POPCOUNTS[nibble_mask]
+        # Find missing suit for 3-card sets: it's the suit with bit=0
+        # missing_suit = first suit where bit is 0 = trailing zeros count
+        # For 0b0111 (missing suit 3), we want 3
+        # For 0b1011 (missing suit 2), we want 2
+        # etc.
+        missing_suit = jnp.where(nibble_mask & 1,
+                                 jnp.where(nibble_mask & 2,
+                                          jnp.where(nibble_mask & 4, 3, 2), 1), 0)
+        meld_id_3 = rank * 5 + missing_suit
+        meld_id_4 = rank * 5 + 4
+        # Return meld_id based on whether it's 3-card or 4-card set
+        # If popcount < 3, no set (return -1)
+        return jnp.where(popcount >= 4, meld_id_4,
+                        jnp.where(popcount >= 3, meld_id_3, jnp.int32(-1)))
+
+    set_meld_A = get_set_meld_id(best_mask_A, set_indices[0])
+    set_meld_B = get_set_meld_id(best_mask_B, set_indices[1])
+    set_meld_C = get_set_meld_id(best_mask_C, set_indices[2])
+
+    # 2. Compute run meld indices from RUN_MEMBER_LUT
+    best_scenario_suits = scenario_suits[best_idx]  # (4,) suit masks after set removal
+    run_member_masks = RUN_MEMBER_LUT[best_scenario_suits]  # (4,) 13-bit masks of cards in runs
+
+    # For each suit, find maximal runs and their meld IDs
+    # 3-card runs: meld_id = 65 + suit * 11 + start_rank (start_rank 0-10)
+    # 4-card runs: meld_id = 109 + suit * 10 + start_rank (start_rank 0-9)
+    # 5-card runs: meld_id = 149 + suit * 9 + start_rank (start_rank 0-8)
+    # For simplicity, we'll mark all valid run melds that match the run_member_mask exactly
+
+    # Build meld mask
+    optimal_meld_mask = jnp.zeros(185, dtype=jnp.bool_)
+
+    # Mark set melds
+    optimal_meld_mask = jnp.where(set_meld_A >= 0,
+                                   optimal_meld_mask.at[set_meld_A].set(True),
+                                   optimal_meld_mask)
+    optimal_meld_mask = jnp.where(set_meld_B >= 0,
+                                   optimal_meld_mask.at[set_meld_B].set(True),
+                                   optimal_meld_mask)
+    optimal_meld_mask = jnp.where(set_meld_C >= 0,
+                                   optimal_meld_mask.at[set_meld_C].set(True),
+                                   optimal_meld_mask)
+
+    # Mark run melds by properly decomposing runs into valid meld combinations
+    # RUN_DECOMP_LUT contains meld IDs for suit 0; adjust for actual suit
+    for suit in range(4):
+        suit_mask = best_scenario_suits[suit]
+        run_meld_ids = RUN_DECOMP_LUT[suit_mask]  # (5,) meld IDs for suit 0
+        for j in range(5):
+            base_meld_id = run_meld_ids[j]  # Meld ID for suit 0, or -1
+            # Adjust for suit:
+            # 3-card runs (65-75 for suit 0): add suit*11
+            # 4-card runs (109-118 for suit 0): add suit*10
+            # 5-card runs (149-157 for suit 0): add suit*9
+            is_3card = (base_meld_id >= 65) & (base_meld_id < 109)
+            is_4card = (base_meld_id >= 109) & (base_meld_id < 149)
+            is_5card = (base_meld_id >= 149) & (base_meld_id < 185)
+            suit_offset = jnp.where(is_3card, suit * 11,
+                                   jnp.where(is_4card, suit * 10,
+                                            jnp.where(is_5card, suit * 9, 0)))
+            meld_id = base_meld_id + suit_offset
+            is_valid = base_meld_id >= 0
+            optimal_meld_mask = jnp.where(is_valid,
+                                          optimal_meld_mask.at[meld_id].set(True),
+                                          optimal_meld_mask)
+
+    return max_meld_points, optimal_meld_mask
 
 
 @jax.jit
@@ -378,9 +546,20 @@ def calculate_deadwood_lut(hand):
     This is the fast version using lookup tables.
     """
     hand_4x13 = hand_to_4x13(hand)
-    max_meld_points = _compute_max_meld_points_3sets(hand_4x13)
+    max_meld_points, _ = _compute_optimal_meld_info(hand_4x13)
     total_hand_value = jnp.sum(hand_4x13.astype(jnp.int32) * RANK_VALUES[None, :])
     return total_hand_value - max_meld_points
+
+
+@jax.jit
+def get_optimal_meld_indices(hand):
+    """Return mask of meld indices that are part of optimal decomposition.
+
+    Returns (185,) bool array where True = meld is in the optimal decomposition.
+    """
+    hand_4x13 = hand_to_4x13(hand)
+    _, optimal_meld_mask = _compute_optimal_meld_info(hand_4x13)
+    return optimal_meld_mask
 
 @jax.jit
 def calculate_deadwood_all_discards_exact(hand):
@@ -722,27 +901,20 @@ def valid_melds_mask(hand):
 def optimal_melds_mask(hand):
     """Return mask of melds that are part of the optimal decomposition.
 
-    A meld is "optimal" if laying it doesn't increase the minimum deadwood.
-    This matches C++ OpenSpiel behavior which only allows optimal melds
-    during KNOCK and LAYOFF phases.
+    A meld is "optimal" if it's one of the EXACT melds used in the
+    optimal meld decomposition. This matches C++ OpenSpiel behavior.
 
     Returns:
-        Boolean array of shape (185,) where True means the meld can be laid
-        without increasing deadwood.
+        Boolean array of shape (185,) where True means the meld can be laid.
     """
-    current_dw = calculate_deadwood_lut(hand)
+    # Get the mask of which meld indices are in the optimal decomposition
+    optimal_indices = get_optimal_meld_indices(hand)
 
     # Check if all meld cards are present in hand
     has_all = jnp.all(hand[None, :] >= MELD_MASKS, axis=1)  # (185,)
 
-    # Compute remaining hands after laying each meld: (185, 52)
-    remaining_hands = jnp.maximum(hand[None, :] - MELD_MASKS, 0)
-
-    # Compute deadwood for all remaining hands
-    remaining_dws = jax.vmap(calculate_deadwood_lut)(remaining_hands)  # (185,)
-
-    # Meld is optimal if: has all cards AND deadwood unchanged after laying it
-    return has_all & (remaining_dws == current_dw)
+    # Meld is optimal if it's in the optimal decomposition AND all cards are in hand
+    return has_all & optimal_indices
 
 
 @jax.jit

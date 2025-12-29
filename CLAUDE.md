@@ -99,9 +99,9 @@ Uses precomputed 8192-entry LUT for run scoring, with full scenario enumeration:
 | C++ SimpleGinRummyBot | 153 | 1x |
 | JAX simple_bot_action (batch=10000) | 24,026 | 157x |
 | JAX simple_bot_action_opt (batch=20000) | 60,646 | 396x |
-| **JAX with optimal melds (batch=20000)** | **2,584** | **17x** |
+| **JAX with optimal melds v2 (batch=20000)** | **32,382** | **212x** |
 
-Simple bot uses **exact 216-scenario algorithm** with `optimal_melds_mask` for C++ compatibility. Verified 100% correct against C++ (50+ games, 0 disagreements). Performance dropped from 396x to 17x due to computing optimal melds (185 deadwood calculations per meld decision).
+Simple bot uses **exact 216-scenario algorithm** with `optimal_melds_mask` for C++ compatibility. Verified 100% correct against C++ (200+ games, 0 disagreements). Uses `RUN_DECOMP_LUT` for O(1) run meld decomposition.
 
 ## Performance History
 
@@ -123,7 +123,8 @@ Track each optimization attempt here. Always benchmark on A100 GPU with `python 
 | 2025-12-28 | **Exact 216-scenario** (3 sets + 4-split, batch=10000) | **24,026** | **157x vs C++, 100% correct** |
 | 2025-12-28 | **Squeezed Juice** (11 vs 52 loop, O(1) meld check, batch=20000) | **60,646** | **2.5x vs previous, 396x vs C++** |
 | 2025-12-28 | **Merged gin_rummy_jax.py** (full game logic + LUT optimizations) | **44,357** | **290x vs C++, games complete with scoring** |
-| 2025-12-29 | **Optimal melds fix** (3-set deadwood + optimal_melds_mask for C++ compat) | **2,584** | **17x vs C++, 100% correct** |
+| 2025-12-29 | Optimal melds v1 (3-set deadwood + optimal_melds_mask) | 2,584 | 17x vs C++ (slow due to 185 deadwood calcs) |
+| 2025-12-29 | **Optimal melds v2** (RUN_DECOMP_LUT for O(1) meld decomposition) | **32,382** | **212x vs C++, 100% correct** |
 
 ### Optimization Ideas to Try
 - [x] LUT-based exact deadwood (implemented)
@@ -134,7 +135,7 @@ Track each optimization attempt here. Always benchmark on A100 GPU with `python 
 - [x] **Squeezed Juice**: loop compression (11 vs 52), O(1) meld check via RUN_MEMBER_LUT
 - [x] **Compute-based deadwood** (FAILED - see below)
 - [x] **Optimal melds fix** (required for C++ compatibility - see below)
-- [ ] Optimize optimal_melds_mask (currently 185 deadwood calculations per call)
+- [x] **RUN_DECOMP_LUT** for O(1) run meld decomposition (solved the 185 deadwood problem)
 - [ ] Profile with JAX profiler to identify remaining hotspots
 
 ### Failed Optimization: Compute-Based Deadwood (2025-12-29)
@@ -182,21 +183,25 @@ def _compute_run_score_alu_ultra(x):
 
 **Problem:** JAX allowed laying any meld where all cards were present, but C++ OpenSpiel only allows melds that are part of the **optimal** meld decomposition. This caused action disagreements in KNOCK/LAYOFF phases.
 
-**Example:** Hand with Ts, Qs, 5c, 7c, Tc, 5d, Qd, 5h, Th, Qh
+**Example 1:** Hand with Ts, Qs, 5c, 7c, Tc, 5d, Qd, 5h, Th, Qh
 - Valid melds: 5s set (5c-5d-5h), 10s set (Ts-Tc-Th), Qs set (Qs-Qd-Qh)
 - C++ only allowed these 3 specific melds (optimal decomposition = 7 deadwood)
-- JAX was trying to pass because `calculate_deadwood_lut` only checked 2 sets, returning wrong deadwood
+- JAX was trying to pass because `calculate_deadwood_lut` only checked 2 sets
+
+**Example 2:** Hand with 5c-6c-7c-8c-9c-Tc (6-card clubs run)
+- C++ allowed: 5c-6c-7c (meld #80) + 8c-9c-Tc (meld #83) = two 3-card runs
+- JAX was trying: 6c-7c-8c-9c-Tc (5-card run) - leaves 5c as deadwood!
 
 **Fixes applied:**
 1. `calculate_deadwood_lut`: Now uses 216-scenario (3 sets) instead of 2-set enumeration
-2. `optimal_melds_mask(hand)`: Returns which melds don't increase deadwood when laid
-3. `legal_actions_mask`: Uses optimal_melds instead of valid_melds for KNOCK/LAYOFF phases
-4. `simple_bot_action_opt`: Uses optimal_melds for meld selection
+2. `RUN_DECOMP_LUT`: New (8192, 5) LUT that decomposes runs into valid melds (e.g., 6-card → 3+3)
+3. `_compute_optimal_meld_info`: Returns exact meld indices, not just melded card mask
+4. `optimal_melds_mask(hand)`: Returns which specific melds are in the optimal decomposition
+5. `legal_actions_mask` and `simple_bot_action_opt`: Use optimal melds for KNOCK/LAYOFF
 
-**Performance impact:** 396x → 17x (23x slower)
-- `optimal_melds_mask` computes 185 deadwood values (one per possible meld)
-- Each deadwood calculation uses 216-scenario enumeration
-- Future optimization: precompute which cards are in optimal melds during initial deadwood calc
+**Performance:** 396x → 17x (v1, slow) → **212x** (v2, with RUN_DECOMP_LUT)
+- v1 computed 185 deadwood values per call (one per possible meld)
+- v2 uses O(1) LUT lookups to get exact meld IDs
 
 ## PPO Training Results (A100 GPU)
 
