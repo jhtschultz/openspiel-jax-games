@@ -454,7 +454,13 @@ def _compute_optimal_meld_info(hand_4x13):
     total_meld_pts = scenario_set_pts + run_total  # (216,)
 
     # Find best scenario
-    best_idx = jnp.argmax(total_meld_pts)
+    # Tie-breaker: C++ prefers sets over runs (explores rank melds first in AllMelds)
+    # When points are tied, prefer scenarios with more cards in sets
+    set_card_count = (NIBBLE_POPCOUNTS[mask_A] + NIBBLE_POPCOUNTS[mask_B] +
+                      NIBBLE_POPCOUNTS[mask_C]).astype(jnp.int32)
+    # Combine: primary = meld points, secondary = set card count
+    score_with_tiebreak = total_meld_pts.astype(jnp.int32) * 100 + set_card_count
+    best_idx = jnp.argmax(score_with_tiebreak)
     max_meld_points = total_meld_pts[best_idx]
 
     # Extract which SPECIFIC melds are used in best scenario
@@ -759,28 +765,64 @@ def simple_bot_action_opt(state):
     upcard = state['upcard']
     deck = state['deck']
 
-    # 1. Compressed deadwood for current hand
+    # 1. Compute optimal melds for 11-card hand, then pick discard from deadwood
+    # C++ approach: BestMeldGroup(11-card hand) → deadwood → sort by RankComparator → back()
+    hand_4x13 = hand_to_4x13(hand)
+    _, optimal_meld_mask_11card = _compute_optimal_meld_info(hand_4x13)
+
+    # Compute which cards are in optimal melds
+    # melded_cards[i] = 1 if card i is in any optimal meld
+    melded_cards = jnp.any(MELD_MASKS * optimal_meld_mask_11card[:, None], axis=0)  # (52,)
+
+    # Deadwood = cards in hand but not in optimal melds
+    deadwood_mask = (hand > 0) & (~melded_cards)
+
+    # Compute min deadwood for knock check
     hand_indices, hand_dws = calculate_deadwood_compressed(hand)
     min_dw_hand = jnp.min(hand_dws)
 
-    # Find best discard (minimize deadwood, break ties by highest value)
-    cand_values = CARD_VALUES[hand_indices]
-    is_optimal = (hand_dws == min_dw_hand) & (hand_dws < 999)
-    discard_score = jnp.where(is_optimal, cand_values.astype(jnp.int16) + 1000, jnp.int16(-1))
-    best_idx_local = jnp.argmax(discard_score)
-    best_discard_card = hand_indices[best_idx_local]
+    # Handle 11-card gin: if no deadwood, find card that preserves gin when discarded
+    has_deadwood = jnp.any(deadwood_mask)
+    # For gin: pick card where discarding it still gives 0 deadwood
+    gin_preserving = (hand_dws == 0) & (hand > 0).take(hand_indices)
+    gin_discard_idx = jnp.argmax(gin_preserving)  # First card that preserves gin
+    gin_discard_card = hand_indices[gin_discard_idx]
+
+    # Find best discard from deadwood (highest rank, then highest card index)
+    card_indices = jnp.arange(52, dtype=jnp.int32)
+    card_ranks = card_indices % 13
+    # Score = rank * 100 + card_index (C++ RankComparator sorts by rank, then card_index)
+    discard_score = jnp.where(deadwood_mask,
+                              card_ranks.astype(jnp.int32) * 100 + card_indices,
+                              jnp.int32(-1))
+    deadwood_discard_card = jnp.argmax(discard_score)
+
+    # Use gin discard if no deadwood, else use deadwood discard
+    best_discard_card = jnp.where(has_deadwood, deadwood_discard_card, gin_discard_card)
 
     # 2. Compressed deadwood with upcard (for draw decisions)
     hand_with_upcard = jnp.where(upcard >= 0, hand.at[upcard].set(1), hand)
     _, up_dws = calculate_deadwood_compressed(hand_with_upcard)
     min_dw_with_upcard = jnp.min(up_dws)
 
+    # Current hand deadwood (10 cards)
+    current_deadwood = calculate_deadwood_lut(hand)
+
     # === DECISION LOGIC ===
 
-    # Draw phase evaluation
+    # Draw phase evaluation: take upcard if it enables knock OR if upcard is in optimal melds
+    # C++ logic: GetBestDeadwood(hand, upcard) returns deadwood for 11-card hand
+    # If upcard NOT in deadwood → upcard is in optimal melds → take it
     upcard_enables_knock = min_dw_with_upcard <= KNOCK_THRESHOLD
-    upcard_in_meld = jnp.where(upcard >= 0, card_would_be_in_meld_fast(hand, upcard), False)
-    take_upcard = upcard_enables_knock | upcard_in_meld
+
+    # Check if upcard is in optimal melds for the 11-card hand
+    hand_with_upcard_4x13 = hand_to_4x13(hand_with_upcard)
+    _, optimal_meld_mask_11 = _compute_optimal_meld_info(hand_with_upcard_4x13)
+    # Check if any optimal meld contains the upcard
+    upcard_in_optimal = jnp.where(upcard >= 0,
+                                   jnp.any(optimal_meld_mask_11 & (MELD_MASKS[:, upcard] > 0)),
+                                   False)
+    take_upcard = upcard_enables_knock | upcard_in_optimal
 
     # Chance action
     is_chance = (phase == PHASE_DEAL) | state['waiting_stock_draw']
@@ -802,9 +844,10 @@ def simple_bot_action_opt(state):
     hand_size = jnp.sum(hand)
     optimal_melds = optimal_melds_mask(hand)
     has_meld_to_lay = jnp.any(optimal_melds)
-    # Pick highest-value optimal meld (greedy)
-    meld_values = jnp.where(optimal_melds, MELD_POINTS, jnp.int32(-1))
-    best_meld_idx = jnp.argmax(meld_values)
+    # Pick highest-index optimal meld (order doesn't affect final score)
+    meld_indices = jnp.arange(NUM_MELDS, dtype=jnp.int32)
+    meld_score = jnp.where(optimal_melds, meld_indices, jnp.int32(-1))
+    best_meld_idx = jnp.argmax(meld_score)
     meld_action = ACTION_MELD_BASE + best_meld_idx
     knock_action = jnp.where(hand_size >= 11, best_discard_card,
                              jnp.where(has_meld_to_lay, meld_action, ACTION_PASS))
@@ -818,9 +861,10 @@ def simple_bot_action_opt(state):
     finished_layoffs = state['finished_layoffs']
     knocker_deadwood = state['knocker_deadwood']
     is_gin = knocker_deadwood == 0
-    effectively_finished = finished_layoffs | is_gin
-    # In post-finish: lay optimal melds if any, else pass
-    layoff_action = jnp.where(effectively_finished & has_meld_to_lay, meld_action, ACTION_PASS)
+    # When knocker has GIN, defender just passes (no layoffs or own melds allowed)
+    # Otherwise, in post-finish: lay optimal melds if any, else pass
+    layoff_action = jnp.where(is_gin, ACTION_PASS,
+                              jnp.where(finished_layoffs & has_meld_to_lay, meld_action, ACTION_PASS))
 
     # Multiplexer
     action = jnp.where(is_chance, chance_action, jnp.int32(0))

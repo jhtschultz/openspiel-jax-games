@@ -18,6 +18,9 @@ Current bottleneck: `calculate_deadwood` is called multiple times per turn (once
 - `gin_rummy_core.py` - Standalone JAX Gin Rummy (no pyspiel, simplified step function). 60k games/sec (396x vs C++).
 - `ppo_gin_rummy_v3_fused.py` - **Main PPO training script**. Fused environment loop, bfloat16, 92k FPS.
 - `ppo_gin_rummy_v2.py` - Previous PPO script (25k FPS, uses fori_loop).
+- `evaluate_checkpoint.py` - **Evaluation script**. Runs games with trained checkpoint, saves full action histories as JSONL.
+- `compare_bots.py` - Compare JAX bot vs C++ SimpleGinRummyBot for verification.
+- `trace_pyspiel.py` - Trace games through pyspiel only for debugging.
 - `connect_four_jax.py` - JAX Connect Four implementation.
 - `benchmark.py` - Benchmark script for gin_rummy_core.py
 - `benchmark_jax.py` - Benchmark script for merged gin_rummy_jax.py
@@ -36,6 +39,12 @@ python benchmark.py --verify
 
 # Run all benchmarks
 python benchmark.py --all
+
+# Evaluate trained checkpoint (saves game histories to JSONL)
+python evaluate_checkpoint.py --n-games 100 --output games.jsonl
+
+# Compare JAX bot vs C++ bot
+python compare_bots.py --n-games 500
 ```
 
 ## Architecture
@@ -67,6 +76,85 @@ Based on OpenSpiel's `simple_gin_rummy_bot`:
 - **Draw**: Take upcard if it enables knock or belongs to a meld, else draw stock
 - **Discard**: Knock if able, else discard highest-value card that minimizes deadwood
 - **Knock**: Discard best card, then pass
+
+### C++ SimpleGinRummyBot Reference
+
+**Source code**: https://github.com/google-deepmind/open_spiel/tree/master/open_spiel/bots/gin_rummy
+
+**Draw Phase Logic** (from `Step` function):
+```cpp
+// Draw upcard if doing so permits a knock, or if the upcard would not be
+// in the "best" deadwood (=> upcard would be in a "best" meld).
+if (utils_.MinDeadwood(hand, upcard) <= knock_card ||
+    !absl::c_linear_search(GetBestDeadwood(hand, upcard), upcard)) {
+  return kDrawUpcardAction;
+}
+```
+- `GetBestDeadwood(hand, upcard)` returns cards NOT in the optimal meld group
+- If upcard is NOT in this list → upcard IS part of an optimal meld → take it
+
+**Discard Logic** (from `GetDiscard` function):
+```cpp
+std::vector<int> deadwood = GetBestDeadwood(hand);
+std::sort(deadwood.begin(), deadwood.end(), RankComparator(kDefaultNumRanks));
+return deadwood.back();
+```
+- Get deadwood (cards not in optimal melds)
+- Sort by `RankComparator`: primary=rank (card % 13), secondary=card index
+- Return `back()` = highest rank, then highest card index for ties
+
+**RankComparator** (from `gin_rummy_utils.h`):
+```cpp
+struct RankComparator {
+  int CardRank(int card) { return card % num_ranks; }
+  bool operator()(int card_1, int card_2) {
+    if (CardRank(card_1) == CardRank(card_2)) {
+      return card_1 < card_2;  // Same rank: sort by card index
+    }
+    return CardRank(card_1) < CardRank(card_2);  // Different rank: sort by rank
+  }
+};
+```
+
+**Meld Selection** (from `GetMelds` function):
+```cpp
+for (const auto& meld : utils_.BestMeldGroup(hand)) {
+  rv.push_back(utils_.meld_to_int.at(meld));
+}
+```
+- Returns melds in the order from `BestMeldGroup`
+- No specific ordering applied
+
+**Known Bug: GIN Layoff Phase**
+When opponent knocks with GIN, the C++ bot queues actions: `[pass, melds..., pass]`
+```cpp
+if (!layed_melds.empty()) {
+  next_actions_.push_back(kPassAction);  // Bot never lays off.
+  for (int meld_id : GetMelds(hand)) {
+    next_actions_.push_back(kMeldActionBase + meld_id);
+  }
+  next_actions_.push_back(kPassAction);
+}
+```
+However, when facing GIN, `finished_layoffs=true` in the game, so the first PASS ends the game immediately before the bot can lay its melds. This causes the defender's entire hand to be counted as deadwood instead of just the remaining cards after laying melds.
+
+**JAX bot behavior**: Correctly lays melds when facing GIN, resulting in lower opponent deadwood and different scores. This is intentional - we don't match the C++ bot's buggy behavior.
+
+**Tie-breaking in BestMeldGroup** (from `gin_rummy_utils.cc`):
+```cpp
+// AllMelds returns: RankMelds first, then SuitMelds
+VecVecInt rank_melds = RankMelds(cards);
+VecVecInt suit_melds = SuitMelds(cards);
+rank_melds.insert(rank_melds.end(), suit_melds.begin(), suit_melds.end());
+
+// BestMeldGroup picks FIRST group with max value (uses > not >=)
+if (meld_group_total_value > best_meld_group_total_value) {
+  best_meld_group = meld_group;
+}
+```
+- **Key insight**: When meld points are tied, SETS are preferred over RUNS
+- Because: `AllMelds` returns rank melds (sets) before suit melds (runs)
+- JAX must match: use set_card_count as tie-breaker in `_compute_optimal_meld_info`
 
 ### Exact 216-Scenario Algorithm
 Uses precomputed 8192-entry LUT for run scoring, with full scenario enumeration:
