@@ -446,6 +446,14 @@ def train(
     # ==========================================================================
     # Orbax requires absolute paths
     checkpoint_dir = os.path.abspath(os.path.expanduser(checkpoint_dir))
+
+    # IMPORTANT: If fresh=True, delete existing checkpoints to avoid orbax conflicts
+    # (orbax gets confused when new step numbers overlap with existing ones)
+    if fresh and os.path.exists(checkpoint_dir):
+        import shutil
+        print(f"  --fresh specified, clearing existing checkpoints in {checkpoint_dir}", flush=True)
+        shutil.rmtree(checkpoint_dir)
+
     os.makedirs(checkpoint_dir, exist_ok=True)
     print(f"  Checkpoint dir: {checkpoint_dir}", flush=True)
 
@@ -606,10 +614,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PPO Training for Gin Rummy")
     parser.add_argument("--fresh", action="store_true", help="Start fresh, ignore existing checkpoints")
     parser.add_argument("--steps", type=int, default=50_000_000, help="Total training timesteps")
+    parser.add_argument("--num-envs", type=int, default=4096, help="Number of parallel environments")
+    parser.add_argument("--num-steps", type=int, default=128, help="Steps per rollout (trajectory length)")
     parser.add_argument("--checkpoint-dir", type=str, default=CHECKPOINT_DIR, help="Checkpoint directory")
     args = parser.parse_args()
 
     train(
+        num_envs=args.num_envs,
+        num_steps=args.num_steps,
         total_timesteps=args.steps,
         fresh=args.fresh,
         checkpoint_dir=args.checkpoint_dir,

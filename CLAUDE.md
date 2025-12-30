@@ -360,20 +360,66 @@ Training a PPO agent against the simple bot using `ppo_gin_rummy_v3_fused.py`.
 - **Fused environment loop**: `scan(10)` replaces `fori_loop(100)` for 3.7x speedup
 - **Orbax checkpointing**: saves/restores training state for resumable training
 
+### Quick Start (A100 GPU)
+
+```bash
+# SSH to VM
+gcloud compute ssh openspiel-dev-a100 --project=open-spiel-ui --zone=us-central1-a
+
+# Launch training with FAST config (101k FPS, reaches 90%+ win rate)
+cd ~/work
+nohup python3 ppo_gin_rummy_v3_fused.py --fresh --num-envs 16384 --num-steps 32 --steps 500000000 > train.log 2>&1 &
+
+# Monitor progress
+tail -f train.log
+
+# Evaluate checkpoint and save game trajectories
+python3 evaluate_checkpoint.py --checkpoint-dir ~/checkpoints/ppo_gin_rummy_v3 --n-games 100 --output games.jsonl
+```
+
+### Generating Game Trajectories
+
+```bash
+# Run trained agent vs simple bot, save action histories
+python3 evaluate_checkpoint.py --checkpoint-dir ~/checkpoints/ppo_gin_rummy_v3 --n-games 100 --output trajectories.jsonl
+```
+
+**Output format** (JSONL - one game per line):
+```json
+{
+  "seed": 0,
+  "agent_player": 0,
+  "history": [13, 8, 20, ..., 52, 24, 53, 14, ..., 55, 45, 185, 54],
+  "p0_score": 49,
+  "p1_score": -49,
+  "agent_won": true
+}
+```
+
+**Action encoding:**
+- `0-51`: Discard card (card_idx = suit*13 + rank, suits: s=0,c=1,d=2,h=3)
+- `52`: Draw upcard
+- `53`: Draw from stock
+- `54`: Pass
+- `55`: Knock
+- `56-240`: Lay meld (meld_id = action - 56)
+
+**Decoding cards:** `card_to_str = lambda c: "A23456789TJQK"[c%13] + "scdh"[c//13]`
+
 ### Training Commands
 
 ```bash
-# Start training (auto-resumes from checkpoint if exists)
+# Default config (4096 envs, 128 steps, 61k FPS)
 python ppo_gin_rummy_v3_fused.py
 
-# Start fresh, ignoring existing checkpoints
+# FAST config (16384 envs, 32 steps, 101k FPS) - RECOMMENDED
+python ppo_gin_rummy_v3_fused.py --num-envs 16384 --num-steps 32
+
+# Start fresh (wipes existing checkpoints)
 python ppo_gin_rummy_v3_fused.py --fresh
 
-# Custom step count
-python ppo_gin_rummy_v3_fused.py --steps 100000000
-
-# Custom checkpoint directory
-python ppo_gin_rummy_v3_fused.py --checkpoint-dir ./my_checkpoints
+# Long overnight run
+python ppo_gin_rummy_v3_fused.py --fresh --num-envs 16384 --num-steps 32 --steps 5000000000
 ```
 
 Checkpoints are saved every 10 updates to `./checkpoints/ppo_gin_rummy_v3/`. The last 3 checkpoints are kept.
@@ -403,6 +449,54 @@ Final:  34.6M steps, 79.7% win rate, 61k FPS
 - Agent reaches ~80% win rate against optimal-strategy bot in 10 minutes
 - Per-update win rate tracking (not cumulative) for accurate progress
 
+### Failed Optimization: V4 Channel-Last + Fused Reset (2025-12-30)
+
+**Hypothesis:** Two "plumbing" optimizations could reduce memory bandwidth:
+1. **Channel-Last Observation**: Eliminate `jnp.transpose(cards, (0, 2, 3, 1))` in the network by stacking cards interleaved in `make_observation`
+2. **Fused Auto-Reset**: Move `env_reset_if_done` logic inside `env_step_fused` to eliminate a separate kernel launch
+
+**Implementation:**
+- Changed observation layout from `[hand[52], discard[52], known[52], other[11]]` to interleaved `[h0,d0,k0, h1,d1,k1, ..., other[11]]`
+- Network reshapes directly to `(batch, 4, 13, 3)` without transpose
+- Reset logic integrated at end of `env_step_fused` with conditional `jax.tree.map`
+
+**Result:** V4 achieved **58k FPS** vs V3's **61k FPS** — about **5% slower**.
+
+**Why it failed:**
+1. XLA already fuses transposes into subsequent conv operations — no physical memory copy was happening
+2. XLA already fuses back-to-back vmapped functions within a JIT-compiled scan — no separate kernel launch
+3. The extra `jnp.stack()` in observation creation added slight overhead
+
+**Lesson:** Don't assume GPU optimization patterns from raw CUDA apply to XLA-compiled JAX. Profile first with `jax.profiler.trace` to see actual kernel boundaries before "optimizing."
+
+### Batch Size Tuning (2025-12-30)
+
+**Experiment:** Test different `num_envs × num_steps` configurations while keeping total samples constant (~500k per update).
+
+**Benchmark Results (A100):**
+| Config | Envs | Steps | FPS | vs Baseline |
+|--------|------|-------|-----|-------------|
+| max envs | 16384 | 32 | 100,839 | **+45%** |
+| more envs | 8192 | 64 | 88,804 | +28% |
+| baseline | 4096 | 128 | 69,547 | — |
+| more steps | 2048 | 256 | 51,504 | -26% |
+| max steps | 1024 | 512 | 33,043 | -52% |
+
+**Key Finding:** GPU strongly prefers width (more parallel envs) over depth (longer scan chains). 16384×32 is 3x faster than 1024×512 with identical sample counts.
+
+**Training Validation (16384×32):**
+```
+Config: num_envs=16384, num_steps=32
+Final:  19.9M steps, 76.5% win rate, 73k FPS
+```
+
+**Trade-off:** Shorter trajectories (32 steps) cause more value function bootstrapping mid-episode, resulting in slightly lower final win rate (76.5% vs 80%). For maximum FPS with acceptable learning, 8192×64 may be the sweet spot (+28% FPS, longer trajectories).
+
+**Scripts:**
+- `benchmark_batch_sizes.py` - Benchmark different configurations
+- `profile_training.py` - JAX profiler trace for kernel analysis
+- `train_fast_config.py` - Quick test with 16384×32 config
+
 ## GCP Setup
 
 ```bash
@@ -424,6 +518,7 @@ Note: A100 VM is preemptible - may restart and lose installed packages.
 2. **Dtype consistency**: `jax.lax.cond` branches must return same dtypes.
 3. **JIT cache**: Set `JAX_COMPILATION_CACHE_DIR=/tmp/jax_cache` to avoid recompilation.
 4. **block_until_ready**: Always call after benchmarked operations - JAX is async.
+5. **Orbax + fresh=True**: When restarting training with `--fresh` in a directory with existing checkpoints, orbax's step numbering gets confused and silently fails to persist new checkpoints. **Fix:** Delete the checkpoint directory before starting fresh (now automatic in v3).
 
 ## Bug Fixes
 
