@@ -12,18 +12,74 @@ Current bottleneck: `calculate_deadwood` is called multiple times per turn (once
 
 **Keep optimizing autonomously.** After each improvement, document it in the Performance History section below and immediately continue to the next optimization. Do not check in with the user or ask for confirmation—just keep iterating until stopped.
 
-## Files
+## Directory Structure
 
+```
+work/
+  # Game implementations
+  gin_rummy_jax.py      # Unified implementation with LUT optimizations (290x vs C++)
+  gin_rummy_core.py     # Standalone JAX Gin Rummy, no pyspiel (396x vs C++)
+
+  # Shared modules (extracted for reuse)
+  constants.py          # Shared constants (card encoding, phases, actions)
+  gin_rummy_luts.py     # Precomputed lookup tables for deadwood
+  gin_rummy_melds.py    # Meld generation and encoding
+  gin_rummy_deadwood.py # Deadwood calculation functions
+
+  # Training & evaluation
+  ppo_gin_rummy_v3_fused.py  # Main PPO training (92k FPS)
+  evaluate_checkpoint.py     # Evaluation with action history export
+  compare_bots.py       # JAX vs C++ bot verification
+  benchmark.py          # Benchmark for gin_rummy_core
+  benchmark_jax.py      # Benchmark for gin_rummy_jax
+
+  # Debugging utilities
+  trace_pyspiel.py      # Game tracing for debugging
+  debug_bot.py          # Bot debugging utilities
+  debug_game.py         # Game state debugging
+
+  # Testing & output
+  tests/                # Pytest test suite
+  output/               # Generated data files (JSONL, JSON)
+  _archive/             # Obsolete/experimental code (see below)
+```
+
+### Tests
+
+Run tests with pytest:
+```bash
+pytest tests/ -v                      # All tests
+pytest tests/test_deadwood.py -v      # Deadwood calculation tests
+pytest tests/test_bot_equivalence.py  # Bot vs C++ comparison (requires pyspiel)
+pytest tests/ -m "not performance"    # Skip slow performance tests
+```
+
+### Archived Files
+
+Located in `_archive/`, kept for reference:
+- `_archive/ppo/` - Old PPO versions (v1, v2) superseded by v3_fused
+- `_archive/debug/` - One-off debug scripts (debug_ppo*.py)
+- `_archive/experiments/` - Incomplete experiments (connect_four_jax.py)
+- `_archive/test_*.py` - Old manual test scripts (replaced by pytest suite)
+
+## Active Files
+
+### Game Implementations
 - `gin_rummy_jax.py` - **Unified implementation** with LUT optimizations, full game logic (knock/layoff/scoring), and pyspiel wrapper. 44k games/sec (290x vs C++).
 - `gin_rummy_core.py` - Standalone JAX Gin Rummy (no pyspiel, simplified step function). 60k games/sec (396x vs C++).
+
+### Shared Modules
+- `constants.py` - Shared constants (card encoding, phases, actions).
+- `gin_rummy_luts.py` - Precomputed lookup tables (RUN_SCORE_LUT, SUBSET_TABLE, etc.).
+- `gin_rummy_melds.py` - Meld generation and encoding (ALL_MELDS, MELD_MASKS, MELD_POINTS).
+- `gin_rummy_deadwood.py` - Deadwood calculation functions (calculate_deadwood_lut, etc.).
+
+### Training & Evaluation
 - `ppo_gin_rummy_v3_fused.py` - **Main PPO training script**. Fused environment loop, bfloat16, 92k FPS.
-- `ppo_gin_rummy_v2.py` - Previous PPO script (25k FPS, uses fori_loop).
-- `evaluate_checkpoint.py` - **Evaluation script**. Runs games with trained checkpoint, saves full action histories as JSONL.
+- `evaluate_checkpoint.py` - **Evaluation script**. Runs games with trained checkpoint, saves action histories to `output/`.
 - `compare_bots.py` - Compare JAX bot vs C++ SimpleGinRummyBot for verification.
-- `trace_pyspiel.py` - Trace games through pyspiel only for debugging.
-- `connect_four_jax.py` - JAX Connect Four implementation.
 - `benchmark.py` - Benchmark script for gin_rummy_core.py
-- `benchmark_jax.py` - Benchmark script for merged gin_rummy_jax.py
+- `benchmark_jax.py` - Benchmark script for gin_rummy_jax.py
 
 ## Usage
 
@@ -322,30 +378,29 @@ python ppo_gin_rummy_v3_fused.py --checkpoint-dir ./my_checkpoints
 
 Checkpoints are saved every 10 updates to `./checkpoints/ppo_gin_rummy_v3/`. The last 3 checkpoints are kept.
 
-**V3 Fused Results (30M steps in ~5 min):**
+**V3 Fused Results (10 min on A100):**
 ```
-Config: num_envs=4096, num_steps=128, ~92k FPS
-Final:  31.5M steps, 81.1% win rate (per-update)
+Config: num_envs=4096, num_steps=128
+Final:  34.6M steps, 79.7% win rate, 61k FPS
 ```
 
 | Steps | Win Rate | FPS | Notes |
 |-------|----------|-----|-------|
-| 0.5M | 0.4% | 8k | Warmup |
-| 5M | 14% | 50k | Rapid learning |
-| 15M | 75% | 78k | Strong play |
-| 30M | **81%** | **92k** | Steady-state |
+| 0.5M | 0.3% | 7k | Warmup/JIT compile |
+| 5M | 14% | 37k | Rapid learning |
+| 10M | 65% | 48k | Strong play |
+| 20M | 77% | 57k | Near convergence |
+| 35M | **80%** | **61k** | Steady-state |
 
 **Version Comparison:**
 | Version | FPS | Speedup | Key Change |
 |---------|-----|---------|------------|
 | V2 (fori_loop) | 25k | 1x | 100-iter loop with early exit |
-| V3 scan(25) | 78k | 3.1x | 25-iter scan, always compute + mask |
-| V3 scan(10) | 92k | **3.7x** | 10-iter scan, less wasted computation |
+| V3 scan(10) | 61k | **2.4x** | 10-iter scan, always compute + mask |
 
 **Observations:**
-- Fused scan(10) + bfloat16 = 3.7x faster training
-- Shorter scan = less wasted computation when games end early
-- Agent reaches 81% win rate against optimal-strategy bot
+- Fused scan(10) + bfloat16 = 2.4x faster training vs V2
+- Agent reaches ~80% win rate against optimal-strategy bot in 10 minutes
 - Per-update win rate tracking (not cumulative) for accurate progress
 
 ## GCP Setup
@@ -369,3 +424,21 @@ Note: A100 VM is preemptible - may restart and lose installed packages.
 2. **Dtype consistency**: `jax.lax.cond` branches must return same dtypes.
 3. **JIT cache**: Set `JAX_COMPILATION_CACHE_DIR=/tmp/jax_cache` to avoid recompilation.
 4. **block_until_ready**: Always call after benchmarked operations - JAX is async.
+
+## Bug Fixes
+
+### 2024-12-29: gin_rummy_core PHASE_KNOCK handling
+
+**Problem:** Games using `gin_rummy_core.py` would get stuck in an infinite loop at PHASE_KNOCK (phase 4). The bot returned discard/pass actions, but the step function ignored them.
+
+**Root Cause:** The `step()` function was missing the handler for PHASE_KNOCK. When a player knocked:
+1. Game entered PHASE_KNOCK
+2. Bot returned valid actions (discard card, then pass)
+3. `step()` had no code for this phase → actions ignored → infinite loop
+
+**Fix:** Added PHASE_KNOCK handling (lines 1115-1142):
+- Process discard actions (player with 11 cards discards to 10)
+- Process pass action → calculate deadwoods, determine winner, transition to GAME_OVER
+- Fixed `new_done` propagation bug (was being overwritten with `state['done']`)
+
+**Verification:** All 54 tests pass (25 game completion + 14 bot equivalence + 15 deadwood).

@@ -11,6 +11,12 @@ Card encoding (matching C++): 0-51 where card = suit * 13 + rank
   Cards 13-25: clubs (Ac, 2c, ..., Kc)
   Cards 26-38: diamonds (Ad, 2d, ..., Kd)
   Cards 39-51: hearts (Ah, 2h, ..., Kh)
+
+Shared modules available for import (optional):
+- constants: NUM_CARDS, NUM_RANKS, PHASE_*, ACTION_* etc.
+- gin_rummy_luts: RUN_SCORE_LUT, RANK_VALUES, SUBSET_TABLE etc.
+- gin_rummy_melds: ALL_MELDS, MELD_MASKS, MELD_POINTS
+- gin_rummy_deadwood: calculate_deadwood_lut, hand_to_4x13
 """
 
 from typing import List, Optional, Tuple

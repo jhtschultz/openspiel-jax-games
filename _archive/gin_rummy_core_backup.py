@@ -1,14 +1,4 @@
-"""JAX Gin Rummy core - standalone version without pyspiel dependency.
-
-This module contains the complete Gin Rummy game implementation optimized for JAX.
-It can run independently without pyspiel.
-
-Shared modules available for import (optional):
-- constants: NUM_CARDS, NUM_RANKS, PHASE_*, ACTION_* etc.
-- gin_rummy_luts: RUN_SCORE_LUT, RANK_VALUES, SUBSET_TABLE etc.
-- gin_rummy_melds: ALL_MELDS, MELD_MASKS, MELD_POINTS
-- gin_rummy_deadwood: calculate_deadwood_lut, hand_to_4x13
-"""
+"""JAX Gin Rummy core - standalone version without pyspiel dependency."""
 
 import numpy as np
 import jax
@@ -16,7 +6,7 @@ import jax.numpy as jnp
 from functools import partial
 
 # =============================================================================
-# Constants (matching C++) - also available from constants.py
+# Constants (matching C++)
 # =============================================================================
 NUM_CARDS = 52
 NUM_RANKS = 13
@@ -1109,37 +1099,10 @@ def step(state, action):
     new_player = jnp.where(discarded, 1 - player, new_player)
 
     new_phase = jnp.where(knocked, jnp.int8(PHASE_KNOCK), new_phase)
-    # Store knocker for scoring
-    new_knocker = jnp.where(knocked, player, state['knocker'])
-
-    # Knock phase - knocker discards then passes
-    is_knock = phase == PHASE_KNOCK
-    knock_discard = is_knock & (action < NUM_CARDS)
-    knock_pass = is_knock & (action == ACTION_PASS)
-
-    # Discard during knock (player has 11 cards, discards to 10)
-    new_p0_hand = jnp.where(knock_discard & (player == 0), new_p0_hand.at[action].set(0), new_p0_hand)
-    new_p1_hand = jnp.where(knock_discard & (player == 1), new_p1_hand.at[action].set(0), new_p1_hand)
-    new_upcard = jnp.where(knock_discard, jnp.int8(action), new_upcard)
-
-    # Pass during knock -> simplified: end game immediately
-    # Calculate deadwoods for scoring
-    knocker_hand = jnp.where(new_knocker == 0, new_p0_hand, new_p1_hand)
-    opponent_hand = jnp.where(new_knocker == 0, new_p1_hand, new_p0_hand)
-    knocker_dw = calculate_deadwood_lut(knocker_hand)
-    opponent_dw = calculate_deadwood_lut(opponent_hand)
-
-    # Knocker wins unless undercut
-    knocker_wins = knocker_dw < opponent_dw
-    new_winner = jnp.where(knock_pass & knocker_wins, new_knocker, state['winner'])
-    new_winner = jnp.where(knock_pass & ~knocker_wins, 1 - new_knocker, new_winner)
-
-    new_phase = jnp.where(knock_pass, jnp.int8(PHASE_GAME_OVER), new_phase)
-    new_done = jnp.where(knock_pass, jnp.bool_(True), state['done'])
 
     # Simplified: end game after some moves for benchmarking
     move_limit = state['cards_dealt'] > 200
-    new_done = jnp.where(move_limit, jnp.bool_(True), new_done)
+    new_done = jnp.where(move_limit, jnp.bool_(True), state['done'])
     new_phase = jnp.where(move_limit, jnp.int8(PHASE_GAME_OVER), new_phase)
 
     return {
@@ -1150,11 +1113,11 @@ def step(state, action):
         'current_player': new_player,
         'phase': new_phase,
         'done': new_done,
-        'winner': new_winner,
+        'winner': state['winner'],
         'cards_dealt': new_cards_dealt,
         'pass_count': new_pass_count,
         'num_draw_upcard': state['num_draw_upcard'],
-        'knocker': new_knocker,
+        'knocker': state['knocker'],
         'knocker_deadwood': state['knocker_deadwood'],
         'layed_melds': state['layed_melds'],
         'layoffs_mask': state['layoffs_mask'],

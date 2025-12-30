@@ -169,7 +169,9 @@ def run_evaluation(checkpoint_dir, n_games=100, output_file=None):
 
     if output_file is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = f"games_{timestamp}.jsonl"
+        output_dir = os.path.join(os.path.dirname(__file__), "output")
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(output_dir, f"games_{timestamp}.jsonl")
 
     agent_wins = 0
 
