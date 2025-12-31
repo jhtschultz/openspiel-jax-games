@@ -458,10 +458,11 @@ def train(
     print(f"  Checkpoint dir: {checkpoint_dir}", flush=True)
 
     # Create checkpoint manager with orbax
+    # Note: We control save frequency ourselves, so set save_interval_steps=1
     checkpointer = ocp.PyTreeCheckpointer()
     options = ocp.CheckpointManagerOptions(
         max_to_keep=3,
-        save_interval_steps=CHECKPOINT_EVERY,
+        save_interval_steps=1,  # We control frequency manually
     )
     ckpt_manager = ocp.CheckpointManager(
         checkpoint_dir,
@@ -488,11 +489,14 @@ def train(
         print(f"Restoring from checkpoint at update {latest_step}...", flush=True)
         ckpt = ckpt_manager.restore(latest_step)
         params = ckpt['params']
-        opt_state = ckpt['opt_state']
+        # Note: We reinitialize opt_state because orbax doesn't preserve optax structure
+        # This loses momentum but preserves the trained weights
+        opt_state = tx.init(params)
         start_update = ckpt['update'] + 1
         # Restore key state for reproducibility
         key = jax.random.PRNGKey(seed + start_update * 1000)
         print(f"Resumed from update {latest_step}, continuing from update {start_update}", flush=True)
+        print(f"  (optimizer state reinitialized - momentum reset)", flush=True)
     elif fresh and latest_step is not None:
         print(f"--fresh specified, ignoring checkpoint at update {latest_step}", flush=True)
     else:
